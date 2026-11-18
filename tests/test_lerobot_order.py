@@ -334,6 +334,12 @@ def main() -> int:
     p.add_argument("--augment_device", choices=["cpu", "gpu"], default="gpu",
                    help="cpu: augmented images must match LeRobot bit for bit (use with --atol 0)")
     args = p.parse_args()
+    if args.video and args.augment_device == "gpu" and args.device != "cpu":
+        # LeRobot 0.7 augments uint8 video frames in float and rounds back to uint8. GPU kernels differ from the
+        # CPU ones in the last float bits, so a pixel sitting on a rounding boundary can land one uint8 level
+        # (1/255 after the loop's division) away. augment_device=cpu has no such difference.
+        args.atol = max(args.atol, 1 / 255 + 1e-6)
+        print(f"  (augment_device=gpu on uint8 video: tolerance one uint8 level, atol={args.atol:.6f})")
 
     import subprocess
 
