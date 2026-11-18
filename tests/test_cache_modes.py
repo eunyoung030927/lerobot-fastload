@@ -126,16 +126,21 @@ def test_restart(data: Data, work: Path) -> list[str]:
     from fastload.cache import COMPLETE_FILE, FILLED_FILE
     from test_lerobot_order import LAST_RUN, _transform_configs, compare, compare_caches, run
 
+    # A larger dataset than the other tests: the loader requests the frames of at least 8 batches ahead (each run of
+    # needed frames extended by a few), which on the 6-episode dataset can already cover every frame, so run 1 would
+    # complete the cache before it is stopped.
+    data = Data(work, data.variant, episodes=30)
     errors: list[str] = []
     cache = work / f"restart_{data.variant}"
     acc = Accelerator(cpu=True)
     tf = _transform_configs()["on"]
     n = data.total_frames()
-    # run 1: stopped after 5 batches; only frames batches asked for are decoded (background filling off)
-    a1 = _order_args(data, cache_dir=str(cache), cache_mode="during_training", background_fill=False, max_batches=5)
+    # run 1: stopped after 3 batches of 4; only frames batches asked for are decoded (background filling off)
+    a1 = _order_args(data, cache_dir=str(cache), cache_mode="during_training", background_fill=False, max_batches=3,
+                     batch=4)
     run("fast", a1, acc, 2, "episode_aware", tf)
     filled1 = int(np.count_nonzero(np.load(cache / FILLED_FILE)))
-    print(f"    run 1 (stopped after 5 batches): {filled1} of {n} frames filled, "
+    print(f"    run 1 (stopped after 3 batches): {filled1} of {n} frames filled, "
           f"{LAST_RUN['fill_stats']['frames']} decoded")
     if (cache / COMPLETE_FILE).exists() or not 0 < filled1 < n:
         errors.append(f"run 1 should leave a partial cache: {filled1} of {n} frames, "
@@ -159,6 +164,8 @@ def test_restart(data: Data, work: Path) -> list[str]:
     ref = run("lerobot", a2, acc, 2, "episode_aware", tf)
     got = run("fast", a2, acc, 2, "episode_aware", tf)
     errors += compare(ref, got, ref[2], 0.0)
+    if LAST_RUN.get("fill_stats_final") is None:  # the cache was complete when run 2 started
+        return errors + ["run 2 had nothing to fill (cache complete after run 1)"]
     decoded2 = LAST_RUN["fill_stats_final"]["frames"]  # the epochs plus the rest finish_cache() decoded
     print(f"    run 2: decoded {decoded2} frames (missing after run 1: {n - filled1}), epoch times "
           f"{', '.join(f'{x:.2f}s' for x in LAST_RUN['epoch_s'])}")

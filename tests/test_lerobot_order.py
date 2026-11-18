@@ -130,7 +130,9 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg):
         for b in dl:
             if max_batches is not None and len(batches) >= max_batches:
                 break  # an interrupted run (tests/test_cache_modes.py: restart)
-            batches.append({k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v) for k, v in b.items()})
+            # clone: a worker's tensors arrive in shared memory, one open file each until freed; keeping them all
+            # would exceed the open-file limit (ulimit -n 1024) on larger test datasets
+            batches.append({k: (v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v) for k, v in b.items()})
             torch.rand(1)  # a CPU draw in the training step (SmolVLA / GR00T time sampling)
             if accelerator.device.type == "cuda":
                 torch.randn(1, device=accelerator.device)  # a GPU draw (pi0.5 / diffusion noise)
