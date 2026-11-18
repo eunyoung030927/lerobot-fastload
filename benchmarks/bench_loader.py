@@ -53,6 +53,8 @@ def main() -> None:
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--video_backend", default=None)
     p.add_argument("--modes", default="video,cache_dl,fast_host,fast_gpu")
+    p.add_argument("--order", default="lerobot", choices=["lerobot", "shard"],
+                   help="FastLoader batch order; multi-process runs here use 'shard' (no accelerate.prepare)")
     a = p.parse_args()
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
@@ -97,7 +99,8 @@ def main() -> None:
             if mode == "fast_gpu" and device.type != "cuda":
                 continue
             ld = FastLoader(dataset(True), a.batch, placement="gpu" if mode == "fast_gpu" else "host",
-                            device=device, rank=rank, world_size=world)
+                            device=device, rank=rank, world_size=world, num_workers=a.num_workers,
+                            order=a.order if world == 1 else "shard")
             it, to_dev = cycle(ld), False
         else:
             raise SystemExit(f"unknown mode {mode}")

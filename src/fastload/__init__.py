@@ -41,11 +41,14 @@ def make_loader(dataset: Any, batch_size: int, *, cache_dir: str | None = None, 
 
     with::
 
-        policy, optimizer, sched = accelerator.prepare(policy, optimizer, sched)
-        dataloader = fastload.make_loader(dataset, bs, cache_dir=CACHE_DIR)
+        dataloader = fastload.make_loader(dataset, bs, cache_dir=CACHE_DIR, shuffle=True, num_workers=NUM_WORKERS)
+        policy, optimizer, dataloader, sched = accelerator.prepare(policy, optimizer, dataloader, sched)
 
-    (create it after the Accelerator so it can read rank / world size / device). Keyword arguments are
-    those of :class:`fastload.loader.FastLoader` (sampler, shuffle, placement, warmup_steps, ...).
+    (create it after the Accelerator so it can read rank / world size / device). ``accelerator.prepare``
+    returns the same FastLoader; with the default ``order="lerobot"`` it shards and seeds the batch order
+    exactly as it would a DataLoader (required with several processes). Pass the ``num_workers`` of the
+    DataLoader you are replacing so image-transform randomness matches. Keyword arguments are those of
+    :class:`fastload.loader.FastLoader` (sampler, shuffle, order, num_workers, placement, ...).
     """
     from fastload.dataset import CachedLeRobotDataset
     from fastload.loader import FastLoader

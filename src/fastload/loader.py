@@ -5,13 +5,23 @@ Data layout per process (rank):
 * host tier  - the cache memmap on local disk / page cache (always holds every frame)
 * GPU tier   - a copy of as many of this rank's episodes as fit in free VRAM (sized per run)
 
-Each step a background thread samples row indices, gathers the frames that are not in the GPU
-tier from the memmap, and copies them to the GPU on a side CUDA stream. The training thread then
+Each step a background thread gathers the frames of an upcoming batch that are not in the GPU
+tier from the memmap and copies them to the GPU on a side CUDA stream. The training thread then
 takes the cached frames straight from VRAM and merges both parts. Non-image columns (state,
 action, indices, ...) live on the GPU for the whole run.
 
 The produced batch has the same keys, dtypes and values as
 ``default_collate([LeRobotDataset[i] for i in rows])``.
+
+Batch order (``order``):
+
+* ``"lerobot"`` (default) - the rows of every batch come from a real DataLoader over row indices
+  built with LeRobot's sampler arguments and prepared by the real accelerate, so each rank gets the
+  same batches, in the same order, with the same RNG draws as LeRobot's DataLoader. Image-transform
+  parameters are drawn from emulated DataLoader-worker RNG streams (``num_workers`` must be LeRobot's)
+  and applied on the GPU. The GPU tier holds a random subset of all frames.
+* ``"shard"`` - each rank owns whole episodes and shuffles within them (fastest multi-GPU; the GPU
+  tier holds this rank's own episodes). Transform parameters use a private RNG stream.
 """
 
 from __future__ import annotations
@@ -29,12 +39,15 @@ from typing import Any, Iterator
 
 import numpy as np
 import torch
+from torch.utils.data.dataloader import DataLoader as _TorchDataLoader
 
 from fastload.dataset import CachedLeRobotDataset
+from fastload.rng import IndexDataset, TransformReplayer, WorkerRNG, collate_rows
 
 logger = logging.getLogger("fastload")
 
 PLACEMENTS = ("auto", "gpu", "host")
+ORDERS = ("lerobot", "shard")
 _ACTIVE_LOADERS: "weakref.WeakSet[FastLoader]" = weakref.WeakSet()
 
 
@@ -101,20 +114,25 @@ class _Prepared:
     cams: dict[str, dict[str, Any]]
     event: Any = None
     keepalive: list[torch.Tensor] = field(default_factory=list)
+    batch_index: int = -1
 
 
 # --------------------------------------------------------------------------------------------
 # loader
 # --------------------------------------------------------------------------------------------
 class FastLoader:
-    """Iterable over training batches for one process. One ``iter()`` = one epoch of this rank's shard.
+    """Iterable over training batches for one process. One ``iter()`` = one epoch.
 
     Args:
         dataset: a :class:`CachedLeRobotDataset` (or a LeRobotDataset plus ``cache_dir``).
         batch_size: per-process batch size (same meaning as DataLoader's ``batch_size``).
-        sampler: optional LeRobot ``EpisodeAwareSampler``; its ``indices`` restrict the frames used.
-        shuffle: shuffle every epoch.
+        sampler: optional sampler, as passed to DataLoader (LeRobot: ``EpisodeAwareSampler``).
+        shuffle: shuffle every epoch (DataLoader's ``shuffle``).
         drop_last: drop the last incomplete batch of an epoch.
+        order: ``"lerobot"`` (same batches and RNG draws as LeRobot's DataLoader) or ``"shard"``
+            (per-rank episode shards); see the module docstring.
+        num_workers: the ``num_workers`` of the DataLoader being reproduced (``order="lerobot"``): image
+            transforms draw from the RNG streams those workers would have. No worker processes are started.
         placement: ``"auto"`` - grow a GPU tier after ``warmup_steps`` batches, sized from the measured
             peak memory of the run; ``"gpu"`` - put this rank's whole shard on the GPU now;
             ``"host"`` - never use VRAM for frames.
@@ -144,6 +162,8 @@ class FastLoader:
         rank: int | None = None,
         world_size: int | None = None,
         cache_dir: str | None = None,
+        order: str = "lerobot",
+        num_workers: int = 0,
     ):
         if not isinstance(dataset, CachedLeRobotDataset):
             if cache_dir is None:
@@ -151,6 +171,10 @@ class FastLoader:
             dataset = CachedLeRobotDataset.from_dataset(dataset, cache_dir)
         if placement not in PLACEMENTS:
             raise ValueError(f"placement must be one of {PLACEMENTS}, got {placement!r}")
+        if order not in ORDERS:
+            raise ValueError(f"order must be one of {ORDERS}, got {order!r}")
+        self.order = order
+        self.num_workers = int(num_workers or 0)
         r, w, dev = _dist_info(device)
         self.rank = r if rank is None else rank
         self.world_size = w if world_size is None else world_size
@@ -209,14 +233,41 @@ class FastLoader:
         self.delta = {k: to_dev(torch.from_numpy(v)) for k, v in self.delta_np.items()}
         self._div255 = torch.tensor(255.0, dtype=torch.float32, device=self.device) if self.is_cuda else 255
 
-        # ---- this rank's shard (whole episodes, balanced over tasks) ---------------------------
-        base_rows = (np.asarray(sampler.indices, dtype=np.int64) if sampler is not None
+        # ---- image transforms: parameters drawn on the CPU, kernels applied on the device -------
+        tf = dataset.image_transforms
+        self.replayer = TransformReplayer(tf) if tf is not None else None
+        self.sample_shape = {}
+        for key in self.cam_keys:
+            c, h, w = self.cam_shape[key]
+            t = len(self.delta_np[key]) if key in self.delta_np else 0
+            squeeze = key in self.video_keys and t == 1
+            self.sample_shape[key] = (c, h, w) if t == 0 or squeeze else (t, c, h, w)
+
+        # ---- rows this rank draws from --------------------------------------------------------
+        has_indices = sampler is not None and hasattr(sampler, "indices")
+        base_rows = (np.asarray(sampler.indices, dtype=np.int64) if has_indices
                      else np.arange(len(dataset), dtype=np.int64))
-        if sampler is not None and not hasattr(sampler, "indices"):
-            raise TypeError("FastLoader only supports samplers exposing `.indices` (EpisodeAwareSampler).")
-        self.local_rows, self.local_episodes = self._shard(base_rows)
+        self._index_loader = None
+        self._prepared_index_loader = None
+        if order == "lerobot":
+            # Same sampler arguments as the DataLoader being replaced; it only yields row indices.
+            self._index_ds = IndexDataset(len(dataset))
+            self.rng = WorkerRNG(self.num_workers)
+            self._index_ds.on_new_iterator = self.rng.begin_epoch
+            self._index_loader = _TorchDataLoader(
+                self._index_ds, batch_size=self.batch_size, shuffle=bool(shuffle) if sampler is None else False,
+                sampler=sampler, drop_last=drop_last, num_workers=0, collate_fn=collate_rows,
+            )
+            _install_accelerate_hook()
+            self.local_rows = base_rows
+            self.local_episodes = np.unique(self._episode_np[base_rows])
+        else:
+            if sampler is not None and not has_indices:
+                raise TypeError("order='shard' only supports samplers exposing `.indices` (EpisodeAwareSampler).")
+            self.rng = WorkerRNG(0, private_seed=self.seed + 7919 * self.rank)
+            self.local_rows, self.local_episodes = self._shard(base_rows)
         if len(self.local_rows) == 0:
-            raise RuntimeError(f"rank {self.rank}: empty shard ({len(base_rows)} frames for {self.world_size} ranks)")
+            raise RuntimeError(f"rank {self.rank}: no frames ({len(base_rows)} frames for {self.world_size} ranks)")
 
         self._tier = _GpuTier()
         self._served = 0
@@ -228,9 +279,10 @@ class FastLoader:
 
         shard_gb = len(self.local_rows) * self.frame_bytes / 1e9
         logger.info(
-            f"fastload: rank {self.rank}/{self.world_size} {len(self.local_episodes)} episodes, "
+            f"fastload: rank {self.rank}/{self.world_size} order={self.order} {len(self.local_episodes)} episodes, "
             f"{len(self.local_rows)} frames ({shard_gb:.1f} GB of frames), placement={self.placement}, "
             f"device={self.device}"
+            + (f", RNG of {self.num_workers} DataLoader workers" if self.order == "lerobot" else "")
         )
         if self.placement == "gpu":
             self.build_gpu_cache(budget_bytes=None)
@@ -250,7 +302,30 @@ class FastLoader:
         keep = np.isin(eps_of_rows, mine)
         return base_rows[keep], np.sort(mine)
 
+    # ------------------------------------------------------------------------------------------
+    # LeRobot-order mode: the index DataLoader and its accelerate-prepared version
+    # ------------------------------------------------------------------------------------------
+    @property
+    def index_loader(self):
+        """The DataLoader over row indices (``order="lerobot"``); accelerate prepares this one."""
+        return self._index_loader
+
+    def attach_prepared_index_loader(self, prepared) -> None:
+        self._prepared_index_loader = prepared
+
+    def _batch_source(self):
+        if self._prepared_index_loader is not None:
+            return self._prepared_index_loader
+        if self.world_size > 1:
+            raise RuntimeError(
+                "fastload: order='lerobot' with several processes needs the loader to go through "
+                "accelerator.prepare(...) (as lerobot-train does), so batches are sharded like LeRobot's"
+            )
+        return self._index_loader
+
     def __len__(self) -> int:
+        if self.order == "lerobot":
+            return len(self._batch_source())
         n = len(self.local_rows)
         return n // self.batch_size if self.drop_last else math.ceil(n / self.batch_size)
 
@@ -363,7 +438,14 @@ class FastLoader:
     # ------------------------------------------------------------------------------------------
     # batch assembly
     # ------------------------------------------------------------------------------------------
-    def _prepare(self, rows: np.ndarray) -> _Prepared:
+    def _draw_ops(self, batch_index: int, n: int) -> list[dict[str, list]] | None:
+        """Transform parameters for the ``n`` samples of a batch (cameras in LeRobot's order)."""
+        if self.replayer is None:
+            return None
+        rec, shapes = self.replayer.record, self.sample_shape
+        return self.rng.draw(batch_index, lambda: [{k: rec(shapes[k]) for k in self.cam_keys} for _ in range(n)])
+
+    def _prepare(self, rows: np.ndarray, batch_index: int = -1) -> _Prepared:
         """CPU work + host->GPU copies for one batch (runs in the background thread)."""
         tier = self._tier
         abs_idx = self._index_np[rows]
@@ -412,7 +494,7 @@ class FastLoader:
                 event = torch.cuda.Event()
                 event.record(self._copy_stream)
         return _Prepared(rows=rows, tier=tier, rows_dev=rows_dev, tasks=tasks,
-                         subtasks=subtasks, cams=cams, event=event, keepalive=keep)
+                         subtasks=subtasks, cams=cams, event=event, keepalive=keep, batch_index=batch_index)
 
     def _sync(self, prep: _Prepared) -> None:
         """Make the training stream wait for the side-stream copies of ``prep``."""
@@ -426,10 +508,10 @@ class FastLoader:
                     entry[name].record_stream(cur)
         prep.rows_dev.record_stream(cur)
 
-    def _finalize(self, prep: _Prepared) -> dict[str, Any]:
+    def _finalize(self, prep: _Prepared, ops: list[dict[str, list]] | None = None) -> dict[str, Any]:
         """GPU-side gathers on the training stream; returns the collated batch."""
         if prep.tier.released:  # its GPU tier was freed (shrink after OOM): rebuild from the host tier
-            prep = self._prepare(prep.rows)
+            prep = self._prepare(prep.rows, prep.batch_index)
         self._sync(prep)
         tier = prep.tier
 
@@ -449,7 +531,8 @@ class FastLoader:
             else:
                 batch[name] = col[rows]
 
-        tf = self.dataset.image_transforms
+        if self.replayer is not None and ops is None:
+            raise RuntimeError("fastload: image transforms are enabled but no parameters were drawn for this batch")
         for key in self.cam_keys:
             entry = prep.cams[key]
             c, h, w = self.cam_shape[key]
@@ -467,8 +550,8 @@ class FastLoader:
                 batch[f"{key}_is_pad"] = (q < frm[:, None]) | (q >= to[:, None])
                 if key in self.video_keys and img.shape[1] == 1:
                     img = img.squeeze(1)  # LeRobot squeezes single-timestamp video queries
-            if tf is not None:
-                img = torch.stack([tf(x) for x in img])  # per-sample, like LeRobotDataset.__getitem__
+            if ops is not None:  # per sample, with the parameters LeRobot's worker would have drawn
+                img = torch.stack([TransformReplayer.apply(x, ops[i][key]) for i, x in enumerate(img)])
             batch[key] = img
 
         if self._task_np is not None:
@@ -484,9 +567,16 @@ class FastLoader:
         self.release_gpu_cache()
         _ACTIVE_LOADERS.discard(self)
 
-    def get_batch(self, rows: list[int] | np.ndarray) -> dict[str, Any]:
-        """Assemble the batch for explicit dataset rows (synchronous; used by tests and benchmarks)."""
-        return self._finalize(self._prepare(np.asarray(rows, dtype=np.int64)))
+    def get_batch(self, rows: list[int] | np.ndarray, ops: list[dict[str, list]] | None = None) -> dict[str, Any]:
+        """Assemble the batch for explicit dataset rows (synchronous; used by tests and benchmarks).
+
+        With image transforms enabled, ``ops`` are the per-sample parameters; if omitted they are drawn
+        from the loader's RNG as batch 0.
+        """
+        rows = np.asarray(rows, dtype=np.int64)
+        if ops is None and self.replayer is not None:
+            ops = self._draw_ops(0, len(rows))
+        return self._finalize(self._prepare(rows), ops)
 
 
 class _null:
@@ -500,17 +590,24 @@ class _null:
 class _EpochIterator:
     def __init__(self, loader: FastLoader, epoch: int):
         self.loader = loader
-        rows = loader.local_rows
-        if loader.shuffle:
-            g = np.random.default_rng(loader.seed + 1_000_003 * epoch + 7919 * loader.rank)
-            rows = rows[g.permutation(len(rows))]
-        bs = loader.batch_size
-        n_batches = len(rows) // bs if loader.drop_last else math.ceil(len(rows) / bs)
-        self.batches = [rows[i * bs:(i + 1) * bs] for i in range(n_batches)]
-        self._next_to_prepare = 0
+        if loader.order == "lerobot":
+            # Iterating the (accelerate-prepared) index DataLoader performs exactly the RNG draws LeRobot's
+            # DataLoader makes when an epoch starts (RNG sync, base_seed, sampler) and yields this rank's
+            # batches. Row indices carry no further randomness, so the whole epoch is listed at once.
+            self.batches = [np.asarray(b, dtype=np.int64) for b in loader._batch_source()]
+        else:
+            rows = loader.local_rows
+            if loader.shuffle:
+                g = np.random.default_rng(loader.seed + 1_000_003 * epoch + 7919 * loader.rank)
+                rows = rows[g.permutation(len(rows))]
+            bs = loader.batch_size
+            n_batches = len(rows) // bs if loader.drop_last else math.ceil(len(rows) / bs)
+            self.batches = [rows[i * bs:(i + 1) * bs] for i in range(n_batches)]
+        self._served = 0
+        self._ops: dict[int, list] = {}
         self._queue: queue.Queue = queue.Queue(maxsize=loader.prefetch)
         self._stop = threading.Event()
-        self._pending: list[np.ndarray] = []
+        self._pending: list[tuple[int, np.ndarray]] = []
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._produce, daemon=True, name="fastload-prefetch")
         self._thread.start()
@@ -526,8 +623,8 @@ class _EpochIterator:
 
     def _produce(self) -> None:
         try:
-            for rows in self.batches:
-                if self._stop.is_set() or not self._put(self.loader._prepare(rows)):
+            for i, rows in enumerate(self.batches):
+                if self._stop.is_set() or not self._put(self.loader._prepare(rows, i)):
                     return
             self._put(StopIteration)
         except BaseException as e:  # surface errors in the training thread
@@ -554,17 +651,32 @@ class _EpochIterator:
                 break
         for item in drained:
             if isinstance(item, _Prepared):
-                self._pending.append(item.rows)
+                self._pending.append((item.batch_index, item.rows))
             else:
                 self._queue.put(item)
 
     def __iter__(self):
         return self
 
+    def _ops_for(self, k: int) -> list | None:
+        """Transform parameters of batch ``k``, drawn in the main thread in LeRobot's order.
+
+        accelerate's DataLoaderShard fetches batch k+1 before yielding batch k, so with
+        ``num_workers=0`` LeRobot draws batch k+1's parameters during the step that returns batch k.
+        """
+        if self.loader.replayer is None:
+            return None
+        for j in (k, k + 1):
+            if j < len(self.batches) and j not in self._ops:
+                self._ops[j] = self.loader._draw_ops(j, len(self.batches[j]))
+        return self._ops.pop(k)
+
     def __next__(self) -> dict[str, Any]:
+        k = self._served
         if self._pending:
-            rows = self._pending.pop(0)
-            batch = self.loader.get_batch(rows)
+            idx, rows = self._pending.pop(0)
+            assert idx == k, (idx, k)
+            batch = self.loader._finalize(self.loader._prepare(rows, idx), self._ops_for(k))
         else:
             item = self._queue.get()
             if item is StopIteration:
@@ -573,12 +685,38 @@ class _EpochIterator:
             if isinstance(item, BaseException):
                 self._stop.set()
                 raise item
-            batch = self.loader._finalize(item)
+            batch = self.loader._finalize(item, self._ops_for(k))
+        self._served += 1
         self.loader._after_batch_served()
         return batch
 
     def __del__(self):
         self._stop.set()
+
+
+_ACCELERATE_HOOKED = False
+
+
+def _install_accelerate_hook() -> None:
+    """Make ``accelerator.prepare(fast_loader)`` prepare its index DataLoader exactly like a DataLoader."""
+    global _ACCELERATE_HOOKED
+    if _ACCELERATE_HOOKED:
+        return
+    try:
+        from accelerate import Accelerator
+    except ImportError:  # pragma: no cover
+        return
+    orig = Accelerator._prepare_one
+
+    def _prepare_one(self, obj, first_pass=False, device_placement=None):
+        if first_pass and isinstance(obj, FastLoader) and obj.index_loader is not None:
+            prepared = self.prepare_data_loader(obj.index_loader, device_placement=device_placement)
+            obj.attach_prepared_index_loader(prepared)
+            return obj
+        return orig(self, obj, first_pass=first_pass, device_placement=device_placement)
+
+    Accelerator._prepare_one = _prepare_one
+    _ACCELERATE_HOOKED = True
 
 
 def _close_all() -> None:

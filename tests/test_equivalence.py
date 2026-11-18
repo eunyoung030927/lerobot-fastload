@@ -12,7 +12,9 @@ Checks
   2. FastLoader.get_batch(rows) == default_collate([LeRobotDataset[i] for i in rows]) with frames
      from the host tier only, from a partial GPU tier, and from a full GPU tier.
   3. The same with a subset of episodes loaded (absolute -> relative index mapping).
-  4. DDP sharding: ranks get disjoint whole episodes that cover the data.
+  4. order="shard": ranks get disjoint whole episodes that cover the data.
+
+Batch order, augmentation and RNG equivalence with order="lerobot": tests/test_lerobot_order.py.
 """
 
 from __future__ import annotations
@@ -131,7 +133,8 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
                   "_get_query_indices (fixed in 0.4.4); FastLoader implements the fixed behaviour")
 
     # 4: sharding
-    shards = [FastLoader(cached, batch, placement="host", device="cpu", rank=r, world_size=3) for r in range(3)]
+    shards = [FastLoader(cached, batch, placement="host", device="cpu", rank=r, world_size=3, order="shard")
+              for r in range(3)]
     all_rows = np.concatenate([s.local_rows for s in shards])
     if len(all_rows) != len(cached) or len(np.unique(all_rows)) != len(cached):
         errors.append("sharding: ranks are not a disjoint cover of the dataset")

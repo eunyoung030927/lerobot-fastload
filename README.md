@@ -19,9 +19,15 @@ mp4 ──(once)──► uint8 cache on local disk ──► page cache (RAM, s
   checks this against your dataset.
 * **No training-code changes.** `fastload.train` runs LeRobot's `lerobot_train.train()` with the data
   loader swapped. Checkpoints and `train_config.json` are plain LeRobot.
-* **Adapts to each run.** Nothing to tune per GPU count: each rank takes whole episodes (spread over
-  tasks), measures its memory after a few steps, and moves as much of its shard to VRAM as fits.
-  Frames not in VRAM are gathered from the cache by a background thread and copied on a side CUDA stream.
+* **Same batch order and randomness as LeRobot** (default `order=lerobot`). Batches are drawn by a real
+  DataLoader over row indices that accelerate prepares exactly like LeRobot's, so every rank gets the
+  same batches in the same order and the process RNG advances identically (this matters for policies
+  that sample on the CPU during training, e.g. SmolVLA and GR00T). Image-augmentation parameters are drawn
+  from the RNG streams LeRobot's `num_workers` DataLoader workers would have, and applied on the GPU.
+  `tests/test_lerobot_order.py` checks batches and RNG states against LeRobot.
+* **Adapts to each run.** Nothing to tune per GPU count: each rank measures its memory after a few steps
+  and moves as many frames to VRAM as fit. Frames not in VRAM are gathered from the cache by a background
+  thread and copied on a side CUDA stream.
 
 Tested with LeRobot 0.4.2 and 0.4.4.
 
@@ -63,6 +69,7 @@ accelerate launch --num_processes 8 -m fastload.train \
 | option | default | meaning |
 |---|---|---|
 | `--fastload.cache_dir` | required | cache built in step 1 |
+| `--fastload.order` | `lerobot` | `lerobot` = LeRobot's batches, order and data RNG (keep `--num_workers` as in your LeRobot runs); `shard` = each rank owns whole episodes (largest VRAM hit rate on many GPUs, different order) |
 | `--fastload.loader` | `fast` | `fast` = FastLoader; `dataloader` = LeRobot's DataLoader reading the cache (no VRAM tier) |
 | `--fastload.placement` | `auto` | `auto` grows a VRAM tier after warm-up; `gpu` puts the whole shard in VRAM at start; `host` never uses VRAM |
 | `--fastload.warmup_steps` | 20 | steps before measuring memory (`auto`) |
@@ -71,18 +78,20 @@ accelerate launch --num_processes 8 -m fastload.train \
 | `--fastload.prefetch` | 2 | batches prepared ahead |
 | `--fastload.oom_retry` | true | single process only: on CUDA OOM halve the VRAM tier and retry the step |
 
-`num_workers`, `pin_memory` and `prefetch_factor` are ignored with `loader=fast`.
+With `loader=fast` no worker processes are started: `num_workers` only selects the emulated worker RNG
+streams for image augmentation, and `pin_memory` / `prefetch_factor` are ignored.
 
 ## Custom training scripts
 
 ```python
 import fastload
 
-# after creating the Accelerator (rank / world size / device are read from it)
-policy, optimizer, lr_scheduler = accelerator.prepare(policy, optimizer, lr_scheduler)  # no dataloader here
+# after creating the Accelerator (rank / world size / device are read from it);
+# same arguments as the DataLoader it replaces, including num_workers
 dataloader = fastload.make_loader(dataset, batch_size, cache_dir="/nvme/fastload/<name>",
-                                  sampler=sampler, shuffle=True)
-for batch in dataloader:   # one epoch of this rank's shard; tensors already on the GPU
+                                  sampler=sampler, shuffle=sampler is None, num_workers=4)
+policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(policy, optimizer, dataloader, lr_scheduler)
+for batch in dataloader:   # one epoch of this rank's batches; tensors already on the GPU
     ...
 ```
 
@@ -101,17 +110,34 @@ torchrun --nproc_per_node 2 benchmarks/bench_loader.py ... --modes fast_host,fas
 The benchmark measures data loading only. Whether training gets faster depends on whether the GPU was
 waiting for data: compare LeRobot's `data_s` with `updt_s` in the training log before switching.
 
-## How sharding works with DDP
+## Batch order and randomness
 
-Each rank owns whole episodes (round-robin after sorting episodes by task), shuffles within its shard
-every epoch, and draws `batch_size` samples per step. Every optimizer step therefore averages
-gradients over samples from all shards, which is the same per-step mixing a distributed sampler gives.
-Shards are fixed for the run; with `world_size=1` the shard is the whole dataset.
+`order=lerobot` (default) reproduces LeRobot's data pipeline:
+
+| LeRobot | fastload |
+|---|---|
+| sampler (`RandomSampler` or `EpisodeAwareSampler`), accelerate batch sharding and RNG sync | the same objects, iterated over row indices (`accelerator.prepare` prepares them) |
+| `base_seed` and sampler seed drawn from the process RNG when each epoch starts | the same draws, at the same point |
+| worker `w` reseeds `torch` / `numpy` / `random` from `base_seed + w`; batch `k` is fetched by worker `k % num_workers` | the same streams, emulated in the main thread (no worker processes) |
+| `num_workers=0`: transforms draw from the process RNG, one batch ahead (accelerate prefetches) | the same |
+| `image_transforms` per sample and camera on the CPU | same parameters; kernels run on the GPU (float rounding differences, ~1e-7) |
+
+With several GPUs every rank's batches come from the whole dataset, so the VRAM tier is a random subset
+of all frames and the rest is read from RAM / disk each batch.
+
+`order=shard` instead gives each rank whole episodes (round-robin after sorting episodes by task),
+shuffled within the shard every epoch. Every optimizer step still averages gradients over samples from
+all shards, but the batches differ from LeRobot's. Use it when VRAM hit rate on many GPUs matters more
+than reproducing LeRobot.
 
 ## Limitations
 
 * Single `LeRobotDataset` (as `lerobot-train`); `StreamingLeRobotDataset` is not supported.
-* Image transforms run per sample on the GPU (same semantics as LeRobot, different RNG stream).
+* Image transforms must be torchvision v2 transforms (LeRobot's are). Their parameters match LeRobot's;
+  the kernels run on the GPU, so augmented pixels can differ from LeRobot's CPU result by float rounding.
+* `order=lerobot` follows `persistent_workers=False` (LeRobot's setting) and a `cycle()` that finishes each
+  epoch before starting the next.
+* GPU kernels themselves are not deterministic by default (`cudnn.benchmark`, atomics), in LeRobot too.
 * OOM recovery is single-process only; under DDP keep `gpu_margin_gb` conservative.
 * The cache uses `index` = absolute frame number, which holds for datasets written by LeRobot.
 

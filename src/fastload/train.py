@@ -28,7 +28,7 @@ from typing import Any
 import torch
 
 from fastload.dataset import CachedLeRobotDataset
-from fastload.loader import PLACEMENTS, FastLoader, active_loaders
+from fastload.loader import ORDERS, PLACEMENTS, FastLoader, active_loaders
 
 logger = logging.getLogger("fastload")
 
@@ -40,6 +40,9 @@ class FastLoadConfig:
     cache_dir: str | None = None
     # "fast" = FastLoader (GPU tier + prefetch thread); "dataloader" = LeRobot's DataLoader over the cache.
     loader: str = "fast"
+    # "lerobot" = same batches, order and data RNG draws as LeRobot's DataLoader (needs the same --num_workers);
+    # "shard" = per-rank episode shards (fastest multi-GPU, not LeRobot's order).
+    order: str = "lerobot"
     placement: str = "auto"  # auto | gpu | host
     warmup_steps: int = 20
     gpu_margin_gb: float | None = None
@@ -52,6 +55,8 @@ class FastLoadConfig:
             raise SystemExit("fastload: --fastload.cache_dir=<dir> is required (build it with fastload.build_cache)")
         if self.loader not in ("fast", "dataloader"):
             raise SystemExit(f"fastload: --fastload.loader must be fast|dataloader, got {self.loader}")
+        if self.order not in ORDERS:
+            raise SystemExit(f"fastload: --fastload.order must be one of {ORDERS}, got {self.order}")
         if self.placement not in PLACEMENTS:
             raise SystemExit(f"fastload: --fastload.placement must be one of {PLACEMENTS}, got {self.placement}")
 
@@ -119,8 +124,10 @@ def install_hooks(fl: FastLoadConfig):
             if fl.loader == "fast" and isinstance(dataset, CachedLeRobotDataset):
                 state["fast_loaders"] += 1
                 sampler = kwargs.get("sampler")
-                ignored = {k: kwargs[k] for k in ("num_workers", "pin_memory", "prefetch_factor") if k in kwargs}
-                logger.info(f"fastload: FastLoader replaces DataLoader (ignoring {ignored})")
+                ignored = {k: kwargs[k] for k in ("pin_memory", "prefetch_factor") if k in kwargs}
+                num_workers = int(kwargs.get("num_workers", 0) or 0)
+                logger.info(f"fastload: FastLoader replaces DataLoader (order={fl.order}, no worker processes; "
+                            f"num_workers={num_workers} only sets the emulated worker RNG; ignoring {ignored})")
                 return FastLoader(
                     dataset,
                     batch_size=kwargs.get("batch_size", 1),
@@ -132,6 +139,8 @@ def install_hooks(fl: FastLoadConfig):
                     gpu_margin_gb=fl.gpu_margin_gb,
                     max_gpu_cache_gb=fl.max_gpu_cache_gb,
                     prefetch=fl.prefetch,
+                    order=fl.order,
+                    num_workers=num_workers,
                 )
             return orig_dataloader(dataset, *args, **kwargs)
 
