@@ -275,12 +275,13 @@ def _key_order(batch: dict) -> list[str]:
     return out
 
 
-def compare(ref, got, cams, atol) -> list[str]:
+def compare(ref, got, cams, atol, max_frac: float | None = None) -> list[str]:
     (rb, rs, _), (gb, gs, _) = ref, got
     errors = []
     if len(rb) != len(gb):
         return [f"batch count {len(rb)} vs {len(gb)}"]
     worst = 0.0
+    n_img = n_off = 0  # image elements compared / beyond atol (for max_frac)
     for i, (a, b) in enumerate(zip(rb, gb)):
         if set(a) != set(b):
             errors.append(f"batch {i}: keys differ {sorted(set(a) ^ set(b))}")
@@ -292,16 +293,28 @@ def compare(ref, got, cams, atol) -> list[str]:
             if isinstance(x, torch.Tensor):
                 if x.dtype != y.dtype or x.shape != y.shape:
                     errors.append(f"batch {i} {k}: {x.dtype}{tuple(x.shape)} vs {y.dtype}{tuple(y.shape)}")
-                elif not torch.equal(x, y):
-                    d = (x.double() - y.double()).abs().max().item() if x.dtype != torch.bool else float("inf")
+                else:
+                    if k in cams:
+                        n_img += x.numel()
+                    if torch.equal(x, y):
+                        continue
+                    diff = (x.double() - y.double()).abs() if x.dtype != torch.bool else None
+                    d = diff.max().item() if diff is not None else float("inf")
                     worst = max(worst, d) if k in cams else worst
-                    if k not in cams or d > atol:
+                    if k in cams and max_frac is not None:
+                        n_off += int((diff > atol).sum())
+                    elif k not in cams or d > atol:
                         errors.append(f"batch {i} {k}: max abs diff {d}")
             elif x != y:
                 errors.append(f"batch {i} {k}: {x!r} vs {y!r}"[:300])
     for e, (a, b) in enumerate(zip(rs, gs)):
         if not _same_states(a, b):
             errors.append(f"epoch {e}: process RNG state differs after the epoch")
+    if max_frac is not None and n_img:
+        frac = n_off / n_img
+        print(f"    images: {n_off} of {n_img} values beyond atol ({frac:.2e}, limit {max_frac:.0e})")
+        if frac > max_frac:
+            errors.append(f"images: {frac:.2e} of values beyond atol (limit {max_frac:.0e})")
     print(f"    images: max abs diff {worst:.3g}" + (" (GPU kernels vs LeRobot's CPU kernels)" if worst else ""))
     return errors
 
@@ -334,13 +347,16 @@ def main() -> int:
     p.add_argument("--augment_device", choices=["cpu", "gpu"], default="gpu",
                    help="cpu: augmented images must match LeRobot bit for bit (use with --atol 0)")
     args = p.parse_args()
+    args.max_frac = None
     if args.video and args.augment_device == "gpu" and args.device != "cpu":
         # LeRobot 0.7 augments uint8 video frames in float and rounds back to uint8 after each transform. GPU
-        # kernels differ from the CPU ones in the last float bits, so a pixel on a rounding boundary can land one
-        # uint8 level away per chained transform (measured: up to 2 levels with every transform enabled).
-        # augment_device=cpu has no such difference.
-        args.atol = max(args.atol, 4 / 255 + 1e-6)
-        print(f"  (augment_device=gpu on uint8 video: tolerance 4 uint8 levels, atol={args.atol:.6f})")
+        # kernels differ from the CPU ones in the last float bits: a pixel on a rounding boundary lands one level
+        # away, and threshold-like transforms (JPEG compression, ...) can turn that into a larger jump at single
+        # pixels. So in this mode images are judged by the fraction of values more than one level apart.
+        # augment_device=cpu has no such difference (compared exactly).
+        args.atol = max(args.atol, 1 / 255 + 1e-6)
+        args.max_frac = 1e-3
+        print(f"  (augment_device=gpu on uint8 video: values more than one uint8 level apart must be < {args.max_frac:.0e})")
 
     import subprocess
 
@@ -375,7 +391,7 @@ def main() -> int:
                 + f" sampler={s} transforms={t}")
         ref = run("lerobot", args, accelerator, w, s, tf_cfgs[t], pw)
         got = run("fast", args, accelerator, w, s, tf_cfgs[t], pw)
-        errors = compare(ref, got, ref[2], args.atol)
+        errors = compare(ref, got, ref[2], args.atol, args.max_frac)
         print(f"  {tag}{name}: {'OK' if not errors else 'FAIL'} ({len(ref[0])} batches)", flush=True)
         for e in errors[:8]:
             print(f"    {e}")
