@@ -15,7 +15,7 @@ mp4 ──(once)──► uint8 cache on local disk ──► page cache (RAM, s
 
 * **Same batches as LeRobot.** Frames are decoded by LeRobot's own `_query_videos` and stored as the
   decoder's uint8 output, so cached frames are bit-identical. Action chunks, `*_is_pad`, observation history,
-  task strings and image transforms follow `LeRobotDataset.__getitem__`. `tests/test_equivalence.py`
+  task strings and image transforms follow `LeRobotDataset.__getitems__`. `tests/test_equivalence.py`
   checks this against your dataset.
 * **No training-code changes.** `fastload.train` runs LeRobot's `lerobot_train.train()` with the data
   loader swapped. Checkpoints and `train_config.json` are plain LeRobot.
@@ -29,22 +29,37 @@ mp4 ──(once)──► uint8 cache on local disk ──► page cache (RAM, s
   and moves as many frames to VRAM as fit. Frames not in VRAM are gathered from the cache by a background
   thread and copied on a side CUDA stream.
 
-**This branch (`lerobot-0.6`) is for LeRobot 0.6.x** (tested with 0.6.1 on CPU; Python >= 3.12).
+**This branch (`lerobot-0.7`) is for LeRobot 0.7.x** (tested with 0.7.0 on CPU; Python >= 3.12).
 
-What changed in LeRobot 0.6 and how this branch follows it:
+What changed in LeRobot 0.7 and how this branch follows it:
 
-* `lerobot_train` builds its datasets with `make_train_eval_datasets` and `return_uint8=True`: video frames
-  stay uint8 through the DataLoader (image transforms run on uint8 in the workers) and the training loop
-  divides by 255 on the device. FastLoader emits the same: uint8 video cameras (transforms applied on uint8),
-  float32 parquet image cameras. Only the training dataset reads from the cache; a held-out eval dataset
-  (`--dataset.eval_split`) and its DataLoader stay LeRobot's.
-* DataLoader workers are `persistent_workers=True` (default with `num_workers > 0`), `prefetch_factor=4`,
-  `multiprocessing_context="spawn"`. `order=lerobot` emulates persistent workers: `base_seed` is drawn and the
-  worker RNG streams are seeded on the first epoch only, later epochs carry the streams on and draw nothing.
-* Every map-style run uses `EpisodeAwareSampler` with its own `(seed, epoch)` generator; FastLoader iterates
-  that sampler (`order=lerobot`) or shards its `.indices` (`order=shard`).
-* Depth cameras (`meta.depth_keys`) are not cached (see Limitations); language columns are dropped from the
-  batch by `lerobot_collate_fn`, and FastLoader does the same.
+* `lerobot_train` builds its DataLoaders in `make_dataloaders` and passes `generator=torch.Generator().manual_seed(seed)`:
+  `base_seed` is drawn from that generator, not from the global RNG. FastLoader takes the same `generator` and
+  its index DataLoader draws from it (with persistent workers only on the first epoch, as before). Everything
+  else in the loader setup (`EpisodeAwareSampler(seed, epoch)` for every map-style dataset, `persistent_workers`,
+  `prefetch_factor`, `spawn`, `return_uint8=True` datasets, uint8 -> float on the device in the loop) is as in 0.6.
+* Image transforms were rewritten: `ImageTransforms` is an `nn.Module` that runs the batched transforms
+  (`BatchedRandomSubsetApply` over `BatchedTransform`s, whose random draws all happen in `make_params`) on a
+  batch of one, and `image_transforms.backend` selects where they run:
+  * `dataloader` (default): per sample in the DataLoader workers. fastload draws the parameters exactly like
+    LeRobot (same calls, same order, same shapes, from the emulated worker RNG streams), including the draws a
+    torchvision transform wrapped in `PerSampleTransform` (`JPEGCompression`, any `torchvision.transforms.v2`
+    class by name) makes while it runs, and applies LeRobot's own transform math with them, with LeRobot's uint8
+    handling (`/255`, transform, `round` back to uint8). `--fastload.augment_device=cpu` stays bit-identical.
+  * `gpu`: the dataset has no transforms and `lerobot_train` augments each batch in the training loop
+    (`ImageAugmentationProcessorStep`, own generator). FastLoader then just delivers the unaugmented batch.
+* Batches come from `LeRobotDataset.__getitems__` (`DatasetReader.get_items`): same values and RNG draws as per-item
+  `__getitem__`, but video frames now come after the tabular columns and `*_is_pad` in each item. FastLoader
+  produces LeRobot's key order.
+* `lerobot_collate_fn` now keeps the language columns (`language_persistent` / `language_events`) as per-sample
+  Python lists (policy processors render them). FastLoader reads them from the parquet rows of each batch.
+* `update_policy` runs inside `accelerator.accumulate(policy)` and steps an optional EMA, so the one-process OOM
+  retry only redoes a step when that is exact (see "Running out of GPU memory").
+* Non-default storage formats (`meta.storage_format`, e.g. `lance`) and `--dataset.streaming=true` are refused with
+  an error (there is nothing to cache in the default layout; train those with plain `lerobot-train`).
+* Context parallelism (`--parallelism.context_parallel.*`) is rejected by LeRobot 0.7.0 itself. `order=lerobot`
+  shards like LeRobot because accelerate prepares the index DataLoader with the same device mesh; `order=shard`
+  refuses context / tensor parallelism.
 
 ## Install
 
@@ -59,9 +74,9 @@ LeRobot minor version. Install the branch that matches the LeRobot in your envir
 | 0.7.x | `lerobot-0.7` (also `main`) |
 
 ```bash
-pip install git+https://github.com/eunyoung030927/lerobot-fastload.git@lerobot-0.6
+pip install git+https://github.com/eunyoung030927/lerobot-fastload.git@lerobot-0.7
 # or, to edit / run the tests and benchmarks:
-git clone -b lerobot-0.6 https://github.com/eunyoung030927/lerobot-fastload.git
+git clone -b lerobot-0.7 https://github.com/eunyoung030927/lerobot-fastload.git
 cd lerobot-fastload && pip install -e .
 ```
 
@@ -117,10 +132,10 @@ emulated worker RNG streams for image augmentation, and `pin_memory` / `prefetch
 import fastload
 
 # after creating the Accelerator (rank / world size / device are read from it);
-# same arguments as the DataLoader it replaces, including num_workers / persistent_workers / collate_fn
+# same arguments as the DataLoader it replaces, including num_workers / persistent_workers / collate_fn / generator
 dataloader = fastload.make_loader(dataset, batch_size, cache_dir="/nvme/fastload/<name>",
                                   sampler=sampler, shuffle=sampler is None, num_workers=4,
-                                  persistent_workers=True)
+                                  persistent_workers=True, generator=torch.Generator().manual_seed(seed))
 policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(policy, optimizer, dataloader, lr_scheduler)
 for batch in dataloader:   # one epoch of this rank's batches; tensors already on the GPU
     ...
@@ -149,10 +164,11 @@ waiting for data: compare LeRobot's `data_s` with `updt_s` in the training log b
 | LeRobot | fastload |
 |---|---|
 | sampler (`EpisodeAwareSampler` seeded from `(seed, epoch)`, or `RandomSampler`), accelerate batch sharding and RNG sync | the same objects, iterated over row indices (`accelerator.prepare` prepares them) |
-| `base_seed` (and a `RandomSampler`'s seed) drawn from the process RNG when an epoch starts; with `persistent_workers` only the first epoch draws `base_seed` | the same draws, at the same point |
+| `base_seed` (and a `RandomSampler`'s seed) drawn from the DataLoader's `generator` (`lerobot_train` 0.7: `torch.Generator().manual_seed(seed)`; without one, the process RNG) when an epoch starts; with `persistent_workers` only the first epoch draws `base_seed` | the same draws, from the same generator, at the same point |
 | worker `w` reseeds `torch` / `numpy` / `random` from `base_seed + w` when it starts (persistent workers: once); batch `k` of every epoch is fetched by worker `k % num_workers` | the same streams, emulated in the main thread (no worker processes) |
 | `num_workers=0`: transforms draw from the process RNG, one batch ahead (accelerate prefetches) | the same |
-| `image_transforms` per sample and camera on the CPU, on uint8 video frames (`return_uint8`) | same parameters; kernels on the GPU (float rounding, see Limitations) or, with `--fastload.augment_device=cpu`, LeRobot's CPU path (bit-identical) |
+| `image_transforms` (`backend=dataloader`) per sample and camera on the CPU, on uint8 video frames (`return_uint8`): `ImageTransforms` draws every parameter in `make_params` (plus the draws of wrapped torchvision transforms while they run) | same parameters, drawn the same way on the CPU; LeRobot's transform math applied on the GPU (float rounding, see Limitations) or, with `--fastload.augment_device=cpu`, LeRobot's CPU path (bit-identical) |
+| `backend=gpu`: no dataset transforms; `lerobot_train` augments the batch in the loop with its own generator | the same (FastLoader delivers the unaugmented batch) |
 
 With several GPUs every rank's batches come from the whole dataset, so the VRAM tier is a random subset
 of all frames and the rest is read from RAM / disk each batch.
@@ -170,7 +186,12 @@ need more (longer sequences, evaluation, checkpointing), so:
 1. **Memory guard** (every step, any number of GPUs): if free VRAM minus the run's peak transient need drops
    below half of `gpu_margin_gb`, whole tier chunks (1 GB each) are dropped until the margin is back. No
    copies; dropped frames are read from RAM / disk again. Batches are unchanged.
-2. **OOM in a step, one process**: halve the tier and retry the step.
+2. **OOM in a step, one process**: halve the tier and retry the step, if the retry is exactly the step LeRobot
+   runs: no gradient accumulation (`--accelerator.gradient_accumulation.steps=1`; a retry would lose the gradients
+   of earlier micro-batches) and the OOM came before the optimizer step (so the parameters, optimizer, scaler,
+   scheduler and EMA are untouched). The process RNG states and the accelerator's step counter are restored before
+   the retry, so the retried step draws the same noise. Otherwise the process stops like several processes do
+   (below), for `fastload.supervise` to resume from the last checkpoint.
 3. **OOM in a step, several processes**: the other ranks already wait in the gradient all-reduce, so one rank
    cannot redo the step alone. All ranks stop at once (instead of hanging until the NCCL timeout) and leave
    a note. Run training under the supervisor to restart automatically from the last checkpoint (LeRobot's
@@ -187,7 +208,7 @@ is renamed to `<output_dir>.oom<N>`.
 ## Data-loader code that wraps LeRobot's video decoder
 
 Training scripts sometimes change frames right after decoding by wrapping the `decode_video_frames` that
-LeRobot's reader calls (LeRobot 0.6: `lerobot.datasets.dataset_reader.decode_video_frames`) (e.g. resizing
+LeRobot's reader calls (LeRobot 0.6 and 0.7: `lerobot.datasets.dataset_reader.decode_video_frames`) (e.g. resizing
 480x640 to 240x320 in the DataLoader workers). fastload never decodes video, so it calls that wrapper itself,
 with the reader's arguments (including `return_uint8=` and `is_depth=False`), while LeRobot's backend decoders
 (`decode_video_frames_torchcodec` / `_pyav`) answer with the cached frames: the wrapper's own code runs on
@@ -200,27 +221,32 @@ otherwise).
 
 ## Limitations
 
-* Single `LeRobotDataset` (as `lerobot-train`); `StreamingLeRobotDataset` is not supported.
-* Image transforms must be torchvision v2 transforms (LeRobot's are, including 0.6's GaussianNoise, MotionBlur,
-  JPEGCompression, ...). Their parameters match LeRobot's; with the default `augment_device=gpu` augmented
-  pixels can differ from LeRobot's CPU result by float rounding: ~1e-6 on float32 cameras, and on uint8 video
-  frames (`return_uint8`) a kernel that rounds or truncates back to uint8 can land one level (1/255) apart at
-  some pixels. GaussianNoise draws its noise on the CPU like LeRobot (a CUDA generator would give different
-  numbers). `augment_device=cpu` makes everything bit-identical at the cost of the VRAM tier and CPU time.
-  (0.6's custom transforms other than SharpnessJitter only act on float frames, so under `return_uint8=True`
-  they are no-ops on video cameras in LeRobot as in fastload; their parameters are still drawn.)
+* Single `LeRobotDataset` in LeRobot's default storage format (as `lerobot-train`); `StreamingLeRobotDataset`
+  (`--dataset.streaming=true`), `MultiLeRobotDataset` and other storage formats (`meta.storage_format`, e.g.
+  `lance`) are refused.
+* Image transforms must be LeRobot's `ImageTransforms` (what `lerobot_train` builds) or a plain
+  `torchvision.transforms.v2` pipeline (custom scripts); the deprecated per-transform front ends of
+  `lerobot.transforms` (`RandomSubsetApply`, `GaussianNoise`, ... used directly) are refused. Their parameters match
+  LeRobot's; with the default `augment_device=gpu` augmented pixels can differ from LeRobot's CPU result by float
+  rounding: ~1e-6 on float32 cameras, and on uint8 video frames (`return_uint8`) the rounding back to uint8 can land
+  one level (1/255) apart at some pixels. On CUDA the batched transforms run on the whole batch at once (as on
+  LeRobot's `gpu` backend); per-sample torchvision transforms (`JPEGCompression`, v2 classes by name) run sample by
+  sample. Random parameters, including GaussianNoise's noise, are drawn on the CPU like LeRobot and copied.
+  `augment_device=cpu` makes everything bit-identical at the cost of the VRAM tier and CPU time. A per-sample
+  torchvision transform that changes the frame size is applied, but later per-sample transforms draw their
+  parameters for the original size.
 * Depth cameras (`meta.depth_keys`, 12-bit / float frames) are not cached: `build_cache` skips them,
   `CachedLeRobotDataset` (`--fastload.loader=dataloader`) decodes them with LeRobot's code and reads the RGB
   cameras from the cache, and FastLoader refuses datasets with depth cameras.
 * Language columns (`language_persistent` / `language_events`) are supported the way `lerobot_train` uses them:
-  `lerobot_collate_fn` drops them from the batch, and FastLoader requires that `collate_fn` for such datasets
+  `lerobot_collate_fn` keeps them as per-sample lists, and FastLoader requires that `collate_fn` for such datasets
   (any other `collate_fn` is refused).
 * `cudnn.benchmark` (on in lerobot-train) picks convolution algorithms at run time, and the choice can depend
   on free GPU memory, which the VRAM tier changes.
 * `order=lerobot` follows the DataLoader's `persistent_workers` (pass it to `make_loader` in custom scripts;
   `fastload.train` takes it from `lerobot_train`) and a `cycle()` that finishes each epoch before starting the
   next. With persistent workers it relies on PyTorch restarting the worker cycle at worker 0 every epoch
-  (checked against torch 2.11).
+  (checked against torch 2.11 and 2.15).
 * GPU kernels themselves are not deterministic by default (`cudnn.benchmark`, atomics), in LeRobot too.
 * The cache uses `index` = absolute frame number, which holds for datasets written by LeRobot.
 

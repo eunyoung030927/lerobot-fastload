@@ -1,20 +1,22 @@
-"""The LeRobot internals fastload touches, for LeRobot 0.6.x (one module per branch).
+"""The LeRobot internals fastload touches, for LeRobot 0.7.x (one module per branch).
 
 ``LeRobotDataset`` is a front object and all reading happens in ``dataset.reader``
-(``lerobot.datasets.dataset_reader.DatasetReader``): ``__getitem__`` -> ``reader.get_item`` ->
-``reader._query_videos`` -> ``dataset_reader.decode_video_frames(..., return_uint8=, is_depth=)``.
+(``lerobot.datasets.dataset_reader.DatasetReader`` for the default ``"lerobot"`` storage format). A DataLoader
+calls ``LeRobotDataset.__getitems__`` -> ``reader.get_items`` (``__getitem__`` -> ``get_item`` is the same code
+on a batch of one): base rows, delta windows + padding, then ``reader._query_videos`` per item ->
+``dataset_reader.decode_video_frames(..., return_uint8=, is_depth=)``, then per item ``apply_rgb_transforms``
+(cameras in ``meta.camera_keys`` order), depth units and ``task``.
 
-Changes from 0.5 that fastload follows:
+Changes from 0.6 that fastload follows:
 
-* ``return_uint8`` (``lerobot_train`` builds datasets with ``return_uint8=True``): RGB video frames stay uint8
-  (no ``/255``); image transforms run on uint8 in the worker and the training loop divides on the device.
-  Parquet image columns are still float32 in [0, 1] (``hf_transform_to_torch`` -> ``ToTensor``).
-* Depth cameras (``meta.depth_keys``): 12-bit / float frames, not cached by fastload.
-* Language columns (``LANGUAGE_COLUMNS``): passed through by ``get_item`` and dropped again by
-  ``lerobot_collate_fn`` (the collate ``lerobot_train`` uses when ``meta.has_language_columns``).
-* ``get_item`` no longer adds ``subtask``.
-* ``EpisodeAwareSampler`` maps to relative rows itself (``absolute_to_relative_idx``); ``.indices`` is a
-  property over relative rows.
+* Video frames are inserted after the tabular columns and the ``*_is_pad`` masks (dict order of items and
+  batches); ``task`` stays last.
+* ``lerobot_collate_fn`` keeps the language columns (``LANGUAGE_COLUMNS``) as per-sample Python lists instead of
+  dropping them; it appends them after the collated tensors, in the iteration order of ``_PYTHON_LIST_KEYS``.
+* Image transforms are ``lerobot.transforms.ImageTransforms`` (an ``nn.Module`` running
+  ``BatchedImageTransforms`` on a batch of one); see :mod:`fastload.rng`.
+* Non-default storage formats (``meta.storage_format``, e.g. ``"lance"``) use another reader and have no
+  ``hf_dataset``; fastload refuses them.
 """
 
 from __future__ import annotations
@@ -22,16 +24,18 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch
 
 from lerobot.datasets.dataset_reader import DatasetReader
 from lerobot.datasets.language import LANGUAGE_COLUMNS
+from lerobot.datasets.storage import DEFAULT_STORAGE_FORMAT
 
 # The module whose global ``decode_video_frames`` the reader calls (wrappers are installed there).
 DECODE_MODULE = "lerobot.datasets.dataset_reader"
 # Backend decoders that ``video_utils.decode_video_frames`` dispatches to (those present are routed).
-BACKEND_DECODERS = ("decode_video_frames_torchcodec", "decode_video_frames_pyav", "decode_video_frames_torchvision")
+BACKEND_DECODERS = ("decode_video_frames_torchcodec", "decode_video_frames_pyav")
 
-__all__ = ["DECODE_MODULE", "BACKEND_DECODERS", "LANGUAGE_COLUMNS"]
+__all__ = ["DECODE_MODULE", "BACKEND_DECODERS", "LANGUAGE_COLUMNS", "DEFAULT_STORAGE_FORMAT"]
 
 
 def reader(ds) -> DatasetReader:
@@ -39,6 +43,20 @@ def reader(ds) -> DatasetReader:
     if r.hf_dataset is None:
         r.load_and_activate()
     return r
+
+
+def storage_format(meta) -> str:
+    return str(getattr(meta, "storage_format", DEFAULT_STORAGE_FORMAT) or DEFAULT_STORAGE_FORMAT)
+
+
+def check_storage_format(meta) -> None:
+    fmt = storage_format(meta)
+    if fmt != DEFAULT_STORAGE_FORMAT:
+        raise NotImplementedError(
+            f"fastload: storage_format={fmt!r} is not supported: fastload caches datasets in LeRobot's default "
+            f"{DEFAULT_STORAGE_FORMAT!r} layout (parquet + mp4, read by DatasetReader). Train this dataset with "
+            "plain lerobot-train."
+        )
 
 
 def delta_indices(ds) -> dict | None:
@@ -79,6 +97,19 @@ def query_videos(ds, query_timestamps: dict[str, list[float]], ep_idx: int) -> d
     return reader(ds)._query_videos(query_timestamps, ep_idx)
 
 
+def normalize_rgb_frames(frames: torch.Tensor, return_uint8: bool) -> torch.Tensor:
+    """What LeRobot's decoders return for raw uint8 RGB frames (uint8, or float32 / 255)."""
+    from lerobot.datasets.video_utils import normalize_rgb_frames as f
+
+    return f(frames, return_uint8)
+
+
+def shift_timestamps(timestamps, offset: float) -> list[float]:
+    from lerobot.datasets.utils import shift_timestamps as f
+
+    return f(timestamps, offset)
+
+
 def depth_keys(meta) -> list[str]:
     return list(getattr(meta, "depth_keys", []) or [])
 
@@ -94,9 +125,28 @@ def language_collate_fn():
     return lerobot_collate_fn
 
 
+def language_batch_keys(columns) -> list[str]:
+    """Language columns in the order ``lerobot_collate_fn`` appends them to a batch in this process.
+
+    ``_PYTHON_LIST_KEYS`` is a set of strings: its iteration order depends on the process's hash seed, so batches
+    collated in spawned DataLoader workers can list these keys in another order (not reproducible across LeRobot
+    runs either). Values are unaffected; only their relative position among themselves can differ."""
+    from lerobot.utils import collate
+
+    keys = [k for k in collate._PYTHON_LIST_KEYS if k in columns]
+    return keys + [k for k in columns if k not in keys]
+
+
 def subtasks(meta):
-    """0.6 ``get_item`` no longer returns ``subtask`` strings."""
+    """``get_item`` returns no ``subtask`` strings (since 0.6)."""
     return None
+
+
+def item_key_order(hf_columns: list[str], delta_keys: list[str], video_keys: list[str]) -> list[str]:
+    """Key order of a 0.7 ``get_items`` item: base columns, ``*_is_pad`` (delta order), video keys, ``task``."""
+    order = list(hf_columns) + [f"{k}_is_pad" for k in delta_keys]
+    order += [k for k in video_keys if k not in order]
+    return order + ["task"]
 
 
 def sampler_rows(sampler) -> np.ndarray:
@@ -110,3 +160,11 @@ def sampler_rows(sampler) -> np.ndarray:
     if rel is not None:
         rows = np.fromiter((rel[int(i)] for i in rows), dtype=np.int64, count=len(rows))
     return rows
+
+
+# ---- image transforms (lerobot.transforms, rewritten in 0.7) -------------------------------------------------
+def lerobot_image_transforms_types():
+    """(ImageTransforms, BatchedRandomSubsetApply, PerSampleTransform, _tag_params)."""
+    from lerobot.transforms import transforms as t
+
+    return t.ImageTransforms, t.BatchedRandomSubsetApply, t.PerSampleTransform, t._tag_params

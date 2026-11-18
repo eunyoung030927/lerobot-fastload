@@ -1,14 +1,18 @@
 """order="lerobot" test: same batches, image augmentation and RNG state as LeRobot's DataLoader.
 
 For each case the same seeded "training loop" runs twice, once over LeRobot's DataLoader and once over
-FastLoader, both passed through ``accelerator.prepare`` like lerobot-train does. The reference DataLoader is
-built as in ``lerobot_train`` 0.6.1: dataset with ``return_uint8=True``, ``EpisodeAwareSampler(seed=...,
-absolute_to_relative_idx=...)``, ``persistent_workers`` / ``prefetch_factor=4`` / ``multiprocessing_context=
-"spawn"`` when ``num_workers > 0``, and ``lerobot_collate_fn`` when the dataset has language columns (the
-``random`` sampler case is a custom script's ``shuffle=True``). Both sides then get the loop's
-``uint8 -> float32 / 255`` camera conversion. The loop body draws from the process RNG (like SmolVLA / GR00T
-sampling the flow-matching time on the CPU), so a shifted RNG anywhere would show up. Compared per batch:
-every tensor and string, and after every epoch the torch (CPU and CUDA) / numpy / python RNG states.
+FastLoader, both passed through ``accelerator.prepare`` like lerobot-train does. Both DataLoaders are built by
+``lerobot_train.make_dataloaders`` itself (LeRobot 0.7: ``EpisodeAwareSampler(seed, absolute_to_relative_idx)``,
+``generator=torch.Generator().manual_seed(seed)``, ``persistent_workers`` / ``prefetch_factor`` /
+``multiprocessing_context`` from TrainPipelineConfig's defaults when ``num_workers > 0``, ``lerobot_collate_fn``
+when the dataset has language columns); on the fastload side with ``fastload.train``'s DataLoader hook installed,
+so ``make_dataloaders`` builds a FastLoader. The dataset is built as ``datasets/factory.py`` does
+(``return_uint8=True``, ``ImageTransforms`` on the "dataloader" backend). The ``random`` sampler case is a custom
+script's ``shuffle=True`` with the same arguments. Both sides then go through the loop's
+``_preprocess_dataset_batch`` (uint8 -> float32 / 255). The loop body draws from the process RNGs (like SmolVLA /
+GR00T / pi0.5 sampling the flow-matching time on the CPU), so a shifted RNG anywhere would show up. Compared per
+batch: every tensor, string and language list, the key order, and after every epoch the torch (CPU and CUDA) /
+numpy / python RNG states.
 
     python tests/test_lerobot_order.py                       # synthetic image dataset (CPU is enough)
     python tests/test_lerobot_order.py --repo_id R --root D --cache_dir C [--device cuda]
@@ -137,46 +141,99 @@ def _same_states(a, b) -> bool:
             and all(np.array_equal(x, y) if isinstance(x, np.ndarray) else x == y for x, y in zip(a[1], b[1])))
 
 
+def _transform_configs():
+    """``on``: lerobot_train's default augmentation. ``all``: every LeRobot 0.7 transform type, including
+    per-sample torchvision ones (JPEGCompression, RandomGrayscale via PerSampleTransform), in random order."""
+    from lerobot.transforms import ImageTransformConfig as C
+    from lerobot.transforms import ImageTransformsConfig
+
+    tfs = {
+        "brightness": C(type="ColorJitter", kwargs={"brightness": (0.8, 1.2)}),
+        "jitter": C(type="ColorJitter",
+                    kwargs={"contrast": (0.8, 1.2), "saturation": (0.5, 1.5), "hue": (-0.05, 0.05)}),
+        "sharpness": C(type="SharpnessJitter", kwargs={"sharpness": (0.5, 1.5)}),
+        "affine": C(type="RandomAffine", kwargs={"degrees": (-5.0, 5.0), "translate": (0.05, 0.05)}),
+        "rotation": C(type="RandomRotation", kwargs={"degrees": 5.0}),
+        "noise": C(type="GaussianNoise", kwargs={"std": (5.0, 25.0)}),
+        "blur": C(type="MotionBlur", kwargs={"kernel_size": (3, 7)}),
+        "patches": C(type="GaussianPatchBrightness"),
+        "shadow": C(type="RandomShadow"),
+        "dropout": C(type="CoarseDropout"),
+        "gamma": C(type="GammaCorrection"),
+        "planckian": C(type="PlanckianJitter"),
+        "jpeg": C(type="JPEGCompression", kwargs={"quality": (30, 90)}),
+        "grayscale": C(type="RandomGrayscale", kwargs={"p": 0.5}),
+    }
+    return {
+        "off": None,
+        "on": ImageTransformsConfig(enable=True, max_num_transforms=3),
+        "all": ImageTransformsConfig(enable=True, max_num_transforms=5, random_order=True, tfs=tfs),
+    }
+
+
+def _train_cfg(args, num_workers: int, persistent: bool):
+    """The fields of TrainPipelineConfig that lerobot_train.make_dataloaders reads (its defaults otherwise)."""
+    from types import SimpleNamespace
+
+    from lerobot.configs.train import TrainPipelineConfig
+
+    fields = TrainPipelineConfig.__dataclass_fields__
+    return SimpleNamespace(
+        seed=args.seed, num_workers=num_workers, batch_size=args.batch, resume=False, checkpoint_path=None,
+        prefetch_factor=fields["prefetch_factor"].default, persistent_workers=persistent,
+        dataloader_multiprocessing_context=fields["dataloader_multiprocessing_context"].default,
+        max_eval_samples=0, dataset=SimpleNamespace(streaming=False),
+        trainable_config=SimpleNamespace(drop_n_first_frames=0, drop_n_last_frames=2),
+    )
+
+
 def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.datasets.sampler import EpisodeAwareSampler
+    import lerobot.scripts.lerobot_train as lt
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
+    from lerobot.distributed import ParallelDims
     from lerobot.transforms import ImageTransforms
-    from lerobot.utils.collate import lerobot_collate_fn
     from lerobot.utils.random_utils import set_seed
 
-    from fastload import CachedLeRobotDataset, FastLoader
+    from fastload import CachedLeRobotDataset
+    from fastload.train import FastLoadConfig, install_hooks
 
     set_seed(args.seed, accelerator=accelerator)
-    from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
-
     meta = LeRobotDatasetMetadata(args.repo_id, root=args.root)
     fps = meta.fps
     cams = list(meta.camera_keys)
     dt = {"action": [i / fps for i in range(4)], cams[0]: [-1 / fps, 0.0]}
+    # as datasets/factory.py (lerobot_train): ImageTransforms on the "dataloader" backend, return_uint8=True
     tf = ImageTransforms(tf_cfg) if tf_cfg is not None else None
     episodes = list(range(args.episodes)) if args.episodes else None
-    # as datasets/factory.py make_dataset (lerobot_train): return_uint8=True
     ds = LeRobotDataset(args.repo_id, root=args.root, delta_timestamps=dt, image_transforms=tf, episodes=episodes,
                         return_uint8=True)
-    sampler = None
-    if sampler_kind == "episode_aware":  # as lerobot_train 0.6.1 (every map-style dataset)
-        sampler = EpisodeAwareSampler(ds.meta.episodes["dataset_from_index"], ds.meta.episodes["dataset_to_index"],
-                                      episode_indices_to_use=ds.episodes, drop_n_last_frames=2, shuffle=True,
-                                      seed=args.seed, absolute_to_relative_idx=ds.absolute_to_relative_idx)
-    collate_fn = lerobot_collate_fn if ds.meta.has_language_columns else None
-    common = dict(batch_size=args.batch, shuffle=sampler is None, sampler=sampler, drop_last=False,
-                  collate_fn=collate_fn)
-    if kind == "lerobot":
-        workers_enabled = num_workers > 0  # lerobot_train._dataloader_worker_kwargs
-        dl = torch.utils.data.DataLoader(
-            ds, num_workers=num_workers, pin_memory=accelerator.device.type == "cuda",
-            prefetch_factor=4 if workers_enabled else None, persistent_workers=persistent and workers_enabled,
-            multiprocessing_context="spawn" if workers_enabled else None, **common)
-    else:
+    cfg = _train_cfg(args, num_workers, persistent)
+    n = accelerator.num_processes
+    pdims = ParallelDims(dp_replicate=n, dp_shard=1, ring=1, ulysses=1, world_size=n,
+                         device_type=accelerator.device.type)
+    undo = None
+    if kind == "fast":
         ds = CachedLeRobotDataset.from_dataset(ds, args.cache_dir)
-        dl = FastLoader(ds, order="lerobot", num_workers=num_workers, persistent_workers=persistent,
-                        placement=args.placement, device=accelerator.device, decode_hook_device=args.hook_device,
-                        augment_device=args.augment_device, **common)
+        fl = FastLoadConfig(cache_dir=args.cache_dir, order="lerobot", placement=args.placement,
+                            decode_hook_device=args.hook_device, augment_device=args.augment_device)
+        undo, _ = install_hooks(fl)  # fastload.train's DataLoader dispatch: the DataLoader below is a FastLoader
+    try:
+        if sampler_kind == "episode_aware":  # lerobot_train 0.7: every map-style dataset
+            dl, _ = lt.make_dataloaders(cfg, ds, None, 0, pdims)
+        else:  # a custom script's shuffle=True, otherwise with make_dataloaders' arguments
+            workers = num_workers > 0
+            dl = torch.utils.data.DataLoader(
+                ds, num_workers=num_workers, batch_size=args.batch, shuffle=True, sampler=None,
+                generator=torch.Generator().manual_seed(cfg.seed), pin_memory=pdims.device_type == "cuda",
+                drop_last=False, collate_fn=lt.lerobot_collate_fn if ds.meta.has_language_columns else None,
+                prefetch_factor=cfg.prefetch_factor if workers else None,
+                persistent_workers=cfg.persistent_workers and workers,
+                multiprocessing_context=cfg.dataloader_multiprocessing_context if workers else None)
+    finally:
+        if undo is not None:
+            undo()
+    if kind == "fast":
+        assert type(dl).__name__ == "FastLoader", type(dl)
     dl = accelerator.prepare(dl)
 
     batches, states = [], []
@@ -184,11 +241,12 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
         for b in dl:
             b = dict(b)
             b["_camera_dtypes"] = {cam: str(b[cam].dtype) for cam in cams if cam in b}  # what the loader emitted
-            for cam in cams:  # lerobot_train's loop: uint8 cameras -> float32 / 255 on the device
-                if cam in b and b[cam].dtype == torch.uint8:
-                    b[cam] = b[cam].to(dtype=torch.float32) / 255.0
+            # lerobot_train's loop: uint8 cameras -> float32 / 255 on the device (no rename, identity preprocessor)
+            b = lt._preprocess_dataset_batch(b, cams, {}, lambda x: x)
             batches.append({k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v) for k, v in b.items()})
-            torch.rand(1)  # a CPU draw in the training step (SmolVLA / GR00T time sampling)
+            torch.rand(1)  # a CPU draw in the training step (SmolVLA / GR00T / pi0.5 time sampling)
+            np.random.rand()
+            random.random()
             if accelerator.device.type == "cuda":
                 torch.randn(1, device=accelerator.device)  # a GPU draw (pi0.5 / diffusion noise)
         states.append(_states())
@@ -203,6 +261,20 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
     return batches, states, cams
 
 
+def _key_order(batch: dict) -> list[str]:
+    """Key order of a batch, the language columns as one block: ``lerobot_collate_fn`` appends them in the iteration
+    order of a set of strings, which depends on the hash seed of the process that collates (a spawned DataLoader
+    worker has its own), so their order among themselves is not reproducible even between LeRobot runs."""
+    from lerobot.datasets.language import LANGUAGE_COLUMNS
+
+    out: list[str] = []
+    for k in batch:
+        k = "<language columns>" if k in LANGUAGE_COLUMNS else k
+        if not out or out[-1] != k:
+            out.append(k)
+    return out
+
+
 def compare(ref, got, cams, atol) -> list[str]:
     (rb, rs, _), (gb, gs, _) = ref, got
     errors = []
@@ -213,6 +285,8 @@ def compare(ref, got, cams, atol) -> list[str]:
         if set(a) != set(b):
             errors.append(f"batch {i}: keys differ {sorted(set(a) ^ set(b))}")
             continue
+        if _key_order(a) != _key_order(b):
+            errors.append(f"batch {i}: key order {list(a)} vs {list(b)}")
         for k in a:
             x, y = a[k], b[k]
             if isinstance(x, torch.Tensor):
@@ -224,12 +298,11 @@ def compare(ref, got, cams, atol) -> list[str]:
                     if k not in cams or d > atol:
                         errors.append(f"batch {i} {k}: max abs diff {d}")
             elif x != y:
-                errors.append(f"batch {i} {k}: {x!r} vs {y!r}")
+                errors.append(f"batch {i} {k}: {x!r} vs {y!r}"[:300])
     for e, (a, b) in enumerate(zip(rs, gs)):
         if not _same_states(a, b):
             errors.append(f"epoch {e}: process RNG state differs after the epoch")
-    if worst:
-        print(f"    images: max abs diff {worst:.3g} (GPU kernels vs LeRobot's CPU kernels)")
+    print(f"    images: max abs diff {worst:.3g}" + (" (GPU kernels vs LeRobot's CPU kernels)" if worst else ""))
     return errors
 
 
@@ -246,6 +319,9 @@ def main() -> int:
     p.add_argument("--workers", default="0,2")
     p.add_argument("--persistent", default="both", choices=["both", "on", "off"],
                    help="persistent_workers for num_workers > 0 (lerobot_train's default is on)")
+    p.add_argument("--samplers", default="random,episode_aware")
+    p.add_argument("--transforms", default="off,on,all",
+                   help="off | on (lerobot_train's default augmentation) | all (every 0.7 transform type)")
     p.add_argument("--atol", type=float, default=1e-5)
     p.add_argument("--episodes", type=int, default=0, help="use only the first N episodes (0 = all)")
     p.add_argument("--video", action="store_true", help="synthetic dataset with mp4 videos instead of images")
@@ -262,7 +338,6 @@ def main() -> int:
     import subprocess
 
     from accelerate import Accelerator
-    from lerobot.transforms import ImageTransformsConfig
 
     tmp = None
     if args.repo_id is None:
@@ -281,23 +356,24 @@ def main() -> int:
         _install_resize_hook()
 
     accelerator = Accelerator(cpu=args.device == "cpu")
-    tf_on = ImageTransformsConfig(enable=True, max_num_transforms=3)
+    tf_cfgs = _transform_configs()
     pers = {"both": (False, True), "on": (True,), "off": (False,)}[args.persistent]
     cases = [(w, s, t, pw) for w in [int(x) for x in args.workers.split(",")]
-             for s in ("random", "episode_aware") for t in (None, tf_on) for pw in (pers if w > 0 else (False,))]
+             for s in args.samplers.split(",") for t in args.transforms.split(",")
+             for pw in (pers if w > 0 else (False,))]
     failed = 0
+    tag = f"[rank {accelerator.process_index}/{accelerator.num_processes}] " if accelerator.num_processes > 1 else ""
     for w, s, t, pw in cases:
         name = (f"num_workers={w}" + (f" persistent={'on' if pw else 'off'}" if w > 0 else "")
-                + f" sampler={s} transforms={'on' if t else 'off'}")
-        ref = run("lerobot", args, accelerator, w, s, t, pw)
-        got = run("fast", args, accelerator, w, s, t, pw)
+                + f" sampler={s} transforms={t}")
+        ref = run("lerobot", args, accelerator, w, s, tf_cfgs[t], pw)
+        got = run("fast", args, accelerator, w, s, tf_cfgs[t], pw)
         errors = compare(ref, got, ref[2], args.atol)
-        tag = f"[rank {accelerator.process_index}/{accelerator.num_processes}] " if accelerator.num_processes > 1 else ""
         print(f"  {tag}{name}: {'OK' if not errors else 'FAIL'} ({len(ref[0])} batches)", flush=True)
         for e in errors[:8]:
             print(f"    {e}")
         failed += bool(errors)
-    print(f"{tag}{'PASS' if not failed else f'FAIL ({failed} cases)'}", flush=True)
+    print(f"{tag}{'PASS' if not failed else f'FAIL ({failed} of {len(cases)} cases)'}", flush=True)
     if tmp is not None:
         tmp.cleanup()
     return 1 if failed else 0

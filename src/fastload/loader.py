@@ -10,21 +10,23 @@ tier from the memmap and copies them to the GPU on a side CUDA stream. The train
 takes the cached frames straight from VRAM and merges both parts. Non-image columns (state,
 action, indices, ...) live on the GPU for the whole run.
 
-The produced batch has the same keys, dtypes and values as
-``default_collate([LeRobotDataset[i] for i in rows])`` (``lerobot_collate_fn`` for datasets with language
-columns, which drops them). With ``LeRobotDataset(return_uint8=True)`` (``lerobot_train`` since LeRobot 0.6)
-video cameras are uint8 ``[.., C, H, W]`` (image transforms run on uint8, like LeRobot's workers) and the
-training loop converts them; parquet image cameras stay float32 in [0, 1].
+The produced batch has the same keys (in the same order), dtypes and values as
+``default_collate(LeRobotDataset.__getitems__(rows))`` (``lerobot_collate_fn`` for datasets with language
+columns, which keeps them as per-sample lists). With ``LeRobotDataset(return_uint8=True)`` (``lerobot_train``
+since LeRobot 0.6) video cameras are uint8 ``[.., C, H, W]`` (image transforms run on uint8, like LeRobot's
+workers) and the training loop converts them; parquet image cameras stay float32 in [0, 1].
 
 Batch order (``order``):
 
 * ``"lerobot"`` (default) - the rows of every batch come from a real DataLoader over row indices
   built with LeRobot's sampler arguments and prepared by the real accelerate, so each rank gets the
   same batches, in the same order, with the same RNG draws as LeRobot's DataLoader. Image-transform
-  parameters are drawn from emulated DataLoader-worker RNG streams (``num_workers`` must be LeRobot's)
-  and applied on the GPU. The GPU tier holds a random subset of all frames.
+  parameters are drawn from emulated DataLoader-worker RNG streams (``num_workers`` must be LeRobot's;
+  ``base_seed`` comes from the DataLoader's ``generator``, as in ``lerobot_train`` 0.7) and applied on the GPU.
+  The GPU tier holds a random subset of all frames.
 * ``"shard"`` - each rank owns whole episodes and shuffles within them (fastest multi-GPU; the GPU
-  tier holds this rank's own episodes). Transform parameters use a private RNG stream.
+  tier holds this rank's own episodes). Transform parameters use a private RNG stream. Not with context /
+  tensor parallelism (ranks of one data-parallel group would need the same batches).
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ from torch.utils.data.dataloader import DataLoader as _TorchDataLoader
 from fastload import _lr
 from fastload.dataset import CachedLeRobotDataset
 from fastload.decode_hook import active_hook, apply_hook, hook_name
-from fastload.rng import IndexDataset, TransformReplayer, WorkerRNG, collate_rows
+from fastload.rng import IndexDataset, WorkerRNG, collate_rows, make_replayer
 
 logger = logging.getLogger("fastload")
 
@@ -82,10 +84,27 @@ def _dist_info(device: torch.device | str | None) -> tuple[int, int, torch.devic
     return rank, world, torch.device(device)
 
 
+def _model_parallel_size() -> int:
+    """tp * cp * sp size of accelerate's parallelism config (1 without one; lerobot_train 0.7 sets cp_size from
+    ``--parallelism.ring`` x ``--parallelism.ulysses``)."""
+    try:
+        from accelerate.state import AcceleratorState
+
+        pc = AcceleratorState._shared_state.get("parallelism_config")
+    except Exception:  # pragma: no cover
+        return 1
+    if pc is None:
+        return 1
+    n = getattr(pc, "non_data_parallel_size", None)
+    if n is not None:
+        return int(n)
+    return int(getattr(pc, "cp_size", 1) or 1) * int(getattr(pc, "tp_size", 1) or 1)
+
+
 def _load_columns(dataset: CachedLeRobotDataset, names: list[str]) -> dict[str, np.ndarray]:
     """Numeric parquet columns as numpy, with LeRobot's dtypes (float -> float32, int -> int64).
 
-    Language columns (lists of message structs) are never passed here: ``lerobot_collate_fn`` drops them.
+    Language columns (lists of message structs) are never passed here: they are read per batch (``_prepare``).
     """
     data = dataset.hf_dataset.select_columns(names).with_format("numpy")[:]
     out = {}
@@ -126,6 +145,7 @@ class _Prepared:
     rows_dev: torch.Tensor
     tasks: list[str]
     subtasks: list[str] | None
+    language: dict[str, list]
     cams: dict[str, dict[str, Any]]
     event: Any = None
     keepalive: list[torch.Tensor] = field(default_factory=list)
@@ -153,7 +173,10 @@ class FastLoader:
             ``num_workers > 0``): worker RNG streams are seeded once and carry on across epochs, and later epochs
             draw no ``base_seed``.
         collate_fn: the DataLoader's ``collate_fn``: None / ``default_collate``, or LeRobot's
-            ``lerobot_collate_fn`` (required for datasets with language columns, which it drops).
+            ``lerobot_collate_fn`` (required for datasets with language columns, which it keeps as lists).
+        generator: the DataLoader's ``generator`` (``lerobot_train`` 0.7: ``torch.Generator().manual_seed(seed)``):
+            ``base_seed`` (and a ``RandomSampler``'s seed) are drawn from it instead of the global RNG
+            (``order="lerobot"``).
         decode_hook_device: where a wrapper around LeRobot's ``decode_video_frames`` (e.g. a resize in the
             data loader) runs: ``"cpu"`` = exactly as LeRobot (bit-identical; those cameras skip the GPU
             tier), ``"gpu"`` = on the batch on the GPU (faster, float-rounding differences).
@@ -198,6 +221,7 @@ class FastLoader:
         augment_device: str = "gpu",
         persistent_workers: bool = False,
         collate_fn: Any = None,
+        generator: torch.Generator | None = None,
     ):
         if not isinstance(dataset, CachedLeRobotDataset):
             if cache_dir is None:
@@ -209,7 +233,13 @@ class FastLoader:
             raise ValueError(f"order must be one of {ORDERS}, got {order!r}")
         if decode_hook_device not in ("cpu", "gpu"):
             raise ValueError(f"decode_hook_device must be 'cpu' or 'gpu', got {decode_hook_device!r}")
+        if order == "shard" and _model_parallel_size() > 1:
+            raise NotImplementedError(
+                "fastload: order='shard' does not support context / tensor parallelism (the ranks of one data-parallel "
+                "group need the same batches); use order='lerobot', which accelerate shards by data-parallel rank"
+            )
         self.order = order
+        self.generator = generator
         self.num_workers = int(num_workers or 0)
         # torch refuses persistent_workers without workers; lerobot_train only sets it when num_workers > 0.
         self.persistent_workers = bool(persistent_workers) and self.num_workers > 0
@@ -254,7 +284,11 @@ class FastLoader:
         self.return_uint8 = _lr.return_uint8(dataset)
         self.raw_keys = {k for k in self.cam_keys if k in self.video_keys and self.return_uint8}
 
-        skip = set(self.cam_keys) | set(_lr.LANGUAGE_COLUMNS)  # language columns: dropped by lerobot_collate_fn
+        # language columns: kept as per-sample lists by lerobot_collate_fn, read from the parquet rows per batch
+        self.language_keys = [n for n in dataset.hf_dataset.column_names if n in _lr.LANGUAGE_COLUMNS]
+        self._language_view = ({n: dataset.hf_dataset.select_columns(n) for n in self.language_keys}
+                               if self.language_keys else {})
+        skip = set(self.cam_keys) | set(_lr.LANGUAGE_COLUMNS)
         hf_names = [n for n in dataset.hf_dataset.column_names if n not in skip]
         cols_np = _load_columns(dataset, hf_names)
         self.columns_cpu = {n: torch.from_numpy(np.ascontiguousarray(a)) for n, a in cols_np.items()
@@ -272,6 +306,10 @@ class FastLoader:
         self._ep_from_np = np.asarray(meta.episodes["dataset_from_index"], dtype=np.int64)
         self._ep_to_np = np.asarray(meta.episodes["dataset_to_index"], dtype=np.int64)
         self.delta_np = {k: np.asarray(v, dtype=np.int64) for k, v in (_lr.delta_indices(dataset) or {}).items()}
+        # LeRobot's item key order (base columns, *_is_pad, video frames, task), then the language lists
+        self._key_order = [k for k in _lr.item_key_order(dataset.hf_dataset.column_names, list(self.delta_np),
+                                                         list(meta.video_keys))
+                           if k not in _lr.LANGUAGE_COLUMNS] + _lr.language_batch_keys(self.language_keys)
 
         # absolute frame index -> row of hf_dataset (only differs when a subset of episodes is loaded)
         rel = None
@@ -313,7 +351,7 @@ class FastLoader:
 
         # ---- image transforms: parameters drawn on the CPU, kernels applied on the device -------
         tf = _lr.image_transforms(dataset)
-        self.replayer = TransformReplayer(tf) if tf is not None else None
+        self.replayer = make_replayer(tf) if tf is not None else None
         # augment_device="cpu": images take LeRobot's exact path (uint8 -> float32 / 255 -> decode hook ->
         # transforms, all on the CPU), so they are bit-identical; no camera can use the GPU tier then.
         self.cpu_augment = self.replayer is not None and augment_device == "cpu"
@@ -340,7 +378,7 @@ class FastLoader:
             self._index_ds.on_new_iterator = self.rng.begin_epoch
             self._index_loader = _TorchDataLoader(
                 self._index_ds, batch_size=self.batch_size, shuffle=bool(shuffle) if sampler is None else False,
-                sampler=sampler, drop_last=drop_last, num_workers=0, collate_fn=collate_rows,
+                sampler=sampler, drop_last=drop_last, num_workers=0, collate_fn=collate_rows, generator=generator,
             )
             _install_accelerate_hook()
             self.local_rows = base_rows
@@ -639,6 +677,9 @@ class FastLoader:
         tasks = [self.task_names[t] for t in self._task_np[rows]] if self._task_np is not None else []
         subtasks = ([self.subtask_names[t] for t in self._subtask_np[rows]]
                     if self._subtask_np is not None else None)
+        # the raw parquet values, as LeRobot's reader returns them (hf_transform_to_torch leaves them alone)
+        idx = rows.tolist()
+        language = {n: view[idx][n] for n, view in self._language_view.items()}
 
         stream_ctx = torch.cuda.stream(self._copy_stream) if self.is_cuda else _null()
         dev_ctx = torch.cuda.device(self.device) if self.is_cuda else _null()
@@ -675,7 +716,7 @@ class FastLoader:
                     x = self._decoded(key, raw.view(len(rows), t, c, h, w), rows, entry.get("ts"))
                     x = self._squeeze(key, x)
                     if ops is not None:
-                        x = torch.stack([TransformReplayer.apply(x[i], ops[i][key]) for i in range(len(rows))])
+                        x = self.replayer.apply_batch(x, [ops[i][key] for i in range(len(rows))])
                         entry["final"] = to_dev(x, pin=True)
                     else:
                         entry["cpu_img"] = x
@@ -710,8 +751,8 @@ class FastLoader:
                 event = torch.cuda.Event()
                 event.record(self._copy_stream)
         return _Prepared(rows=rows, tier=tier, rows_dev=rows_dev, tasks=tasks,
-                         subtasks=subtasks, cams=cams, event=event, keepalive=keep, batch_index=batch_index,
-                         ops=ops)
+                         subtasks=subtasks, language=language, cams=cams, event=event, keepalive=keep,
+                         batch_index=batch_index, ops=ops)
 
     def _sync(self, prep: _Prepared) -> None:
         """Make the training stream wait for the side-stream copies of ``prep``."""
@@ -764,8 +805,7 @@ class FastLoader:
                 if "final" in entry:
                     batch[key] = entry["final"]
                 else:  # num_workers=0: parameters come from the process RNG at LeRobot's time (main thread)
-                    x = entry["cpu_img"]
-                    x = torch.stack([TransformReplayer.apply(x[i], ops[i][key]) for i in range(n_b)])
+                    x = self.replayer.apply_batch(entry["cpu_img"], [ops[i][key] for i in range(n_b)])
                     batch[key] = x.to(self.device)
                 continue
             if "post" in entry:
@@ -787,14 +827,19 @@ class FastLoader:
             else:
                 img = img[:, 0]
             if ops is not None:  # per sample, with the parameters LeRobot's worker would have drawn
-                img = torch.stack([TransformReplayer.apply(x, ops[i][key]) for i, x in enumerate(img)])
+                img = self.replayer.apply_batch(img, [ops[i][key] for i in range(n_b)])
             batch[key] = img
 
         if self._task_np is not None:
             batch["task"] = prep.tasks
         if prep.subtasks is not None:
             batch["subtask"] = prep.subtasks
-        return batch
+        batch.update(prep.language)
+        # LeRobot's key order (some policies / processors iterate the batch)
+        ordered = {k: batch[k] for k in self._key_order if k in batch}
+        if len(ordered) != len(batch):
+            ordered.update({k: v for k, v in batch.items() if k not in ordered})
+        return ordered
 
     def close(self) -> None:
         """Stop prefetch threads and free the GPU tier. Called automatically at interpreter exit."""
@@ -841,20 +886,49 @@ class _EpochIterator:
             self.batches = [rows[i * bs:(i + 1) * bs] for i in range(n_batches)]
         self._served = 0
         self._ops: dict[int, list] = {}
-        # augment_device="cpu": the prefetch thread applies the transforms, so it needs the parameters up front.
-        # Worker RNG streams (num_workers > 0) and the private stream do not depend on when they are drawn,
-        # so the whole epoch is drawn here; with num_workers=0 LeRobot draws from the process RNG during
-        # each step, so those batches are transformed on the main thread instead.
-        self._pre_ops = None
+        # augment_device="cpu": the prefetch thread applies the transforms, so it needs the parameters ahead of
+        # time. Worker RNG streams (num_workers > 0) and the private stream do not depend on when they are drawn,
+        # so the main thread draws them a few batches ahead (only the main thread touches the process RNG; only a
+        # few batches, since parameters such as GaussianNoise's noise are frame-sized). With num_workers=0 LeRobot
+        # draws from the process RNG during each step, so those batches are transformed on the main thread instead.
+        self._pre_ops: dict[int, list] | None = None
+        self._pre_cond = threading.Condition()
+        self._pre_ahead = loader.prefetch + 2
+        self._pre_drawn = 0
+        self._stop = threading.Event()
         rng = loader.rng
         if loader.cpu_augment and (rng.private_seed is not None or rng.num_workers > 0):
-            self._pre_ops = [loader._draw_ops(i, len(b)) for i, b in enumerate(self.batches)]
+            self._pre_ops = {}
+            self._draw_ahead(0)
         self._queue: queue.Queue = queue.Queue(maxsize=loader.prefetch)
-        self._stop = threading.Event()
         self._pending: list[tuple[int, np.ndarray]] = []
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._produce, daemon=True, name="fastload-prefetch")
         self._thread.start()
+
+    def _draw_ahead(self, k: int) -> None:
+        """Main thread: draw the parameters of the batches before ``k + _pre_ahead`` (in batch order)."""
+        if self._pre_ops is None:
+            return
+        last = min(len(self.batches), k + self._pre_ahead)
+        while self._pre_drawn < last:
+            i = self._pre_drawn
+            ops = self.loader._draw_ops(i, len(self.batches[i]))
+            with self._pre_cond:
+                self._pre_ops[i] = ops
+                self._pre_drawn += 1
+                self._pre_cond.notify_all()
+
+    def _take_pre_ops(self, i: int) -> list | None:
+        """Prefetch thread: the parameters of batch ``i`` (waits until the main thread has drawn them)."""
+        if self._pre_ops is None:
+            return None
+        with self._pre_cond:
+            while i not in self._pre_ops:
+                if self._stop.is_set():
+                    return None
+                self._pre_cond.wait(timeout=0.1)
+            return self._pre_ops[i]
 
     def _put(self, item: Any) -> bool:
         while not self._stop.is_set():
@@ -868,7 +942,7 @@ class _EpochIterator:
     def _produce(self) -> None:
         try:
             for i, rows in enumerate(self.batches):
-                pre = self._pre_ops[i] if self._pre_ops is not None else None
+                pre = self._take_pre_ops(i)
                 if self._stop.is_set() or not self._put(self.loader._prepare(rows, i, pre)):
                     return
             self._put(StopIteration)
@@ -918,10 +992,15 @@ class _EpochIterator:
 
     def __next__(self) -> dict[str, Any]:
         k = self._served
+        self._draw_ahead(k + 1)
+        if self._pre_ops is not None:
+            with self._pre_cond:  # parameters of batches already served are no longer needed
+                for j in [j for j in self._pre_ops if j < k]:
+                    del self._pre_ops[j]
         if self._pending:
             idx, rows = self._pending.pop(0)
             assert idx == k, (idx, k)
-            pre = self._pre_ops[idx] if self._pre_ops is not None else None
+            pre = self._pre_ops.get(idx) if self._pre_ops is not None else None
             batch = self.loader._finalize(self.loader._prepare(rows, idx, pre), self._ops_for(k))
         else:
             item = self._queue.get()

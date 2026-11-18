@@ -12,7 +12,8 @@ wrapper itself, with the same arguments as LeRobot's reader (``video_path, times
 return_uint8=..., is_depth=False``), while LeRobot's backend decoders temporarily answer with the cached
 frames: the wrapper sees exactly what LeRobot's decoder would have returned (``[T, C, H, W]``; uint8 when
 ``return_uint8`` - as in ``lerobot_train`` since LeRobot 0.6 - else float32 in [0, 1]) and its own code runs
-unchanged, at the same point of the pipeline (before ``image_transforms``).
+unchanged, at the same point of the pipeline (before ``image_transforms``). LeRobot 0.7 decodes the cameras of an
+item on a thread pool; fastload calls the wrapper once per camera on its own thread (the override is thread-local).
 """
 
 from __future__ import annotations
@@ -36,10 +37,12 @@ def _vu():
 
 def _as_decoded(frames: torch.Tensor, return_uint8: bool) -> torch.Tensor:
     """Cached uint8 frames as the backend decoder returns them (uint8, or float32 / 255)."""
-    if return_uint8:
-        return frames
-    div = torch.tensor(255.0, dtype=torch.float32, device=frames.device) if frames.is_cuda else 255
-    return frames.to(torch.float32) / div
+    if return_uint8 or not frames.is_cuda:
+        from fastload._lr import normalize_rgb_frames
+
+        return normalize_rgb_frames(frames, return_uint8)  # LeRobot's own conversion
+    # On CUDA, dividing by a Python scalar becomes x * (1/255) (1-ulp differences); a 0-dim tensor keeps a division.
+    return frames.to(torch.float32) / torch.tensor(255.0, dtype=torch.float32, device=frames.device)
 
 
 def _install() -> None:
@@ -50,7 +53,7 @@ def _install() -> None:
     from fastload._lr import BACKEND_DECODERS
 
     vu = _vu()
-    for name in BACKEND_DECODERS:  # LeRobot 0.6: torchcodec and pyav (torchvision was removed)
+    for name in BACKEND_DECODERS:  # torchcodec and pyav (decode_video_frames maps 'video_reader' to pyav)
         orig = getattr(vu, name, None)
         if orig is None:
             continue

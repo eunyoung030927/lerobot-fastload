@@ -8,13 +8,16 @@ Usage: the normal lerobot-train arguments plus ``--fastload.*`` options::
 
 This runs LeRobot's own ``lerobot.scripts.lerobot_train.train`` unchanged except for three hooks:
 
-1. ``make_train_eval_datasets`` (LeRobot 0.6) returns the training dataset as a :class:`CachedLeRobotDataset`
-   (frames from the cache, not video). A held-out eval dataset (``--dataset.eval_split``) stays LeRobot's.
-2. The ``DataLoader`` that train() builds for that dataset becomes a :class:`FastLoader`
-   (``--fastload.loader=dataloader`` keeps LeRobot's DataLoader and only swaps the video decoding). Its
-   ``num_workers`` / ``persistent_workers`` / ``collate_fn`` select the emulated behaviour; the eval
-   DataLoader stays a plain DataLoader.
-3. ``update_policy`` handles a CUDA OOM: one process -> halve the GPU frame tier and retry the step;
+1. ``make_train_eval_datasets`` returns the training dataset as a :class:`CachedLeRobotDataset` (frames from the
+   cache, not video). A held-out eval dataset (``--dataset.eval_split``) stays LeRobot's. Streaming datasets and
+   non-default storage formats are refused.
+2. The ``DataLoader`` that ``make_dataloaders`` (LeRobot 0.7) builds for that dataset becomes a
+   :class:`FastLoader` (``--fastload.loader=dataloader`` keeps LeRobot's DataLoader and only swaps the video
+   decoding). Its ``num_workers`` / ``persistent_workers`` / ``collate_fn`` / ``generator`` select the emulated
+   behaviour; the eval DataLoader stays a plain DataLoader.
+3. ``update_policy`` handles a CUDA OOM: one process -> halve the GPU frame tier and retry the step, but only
+   if the step can be redone exactly (no gradient accumulation, the optimizer step had not started; process RNG
+   states and the accelerator's step counter are restored first), otherwise stop like several processes do;
    several processes -> stop all of them at once with a note that ``python -m fastload.supervise`` uses to
    restart from the last checkpoint with a smaller tier. (FastLoader also shrinks the tier before an OOM
    when the run's peak memory grows; see ``memory_guard``.)
@@ -26,15 +29,18 @@ not written into train_config.json, so checkpoints stay loadable by plain LeRobo
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import logging
 import os
+import random
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 
 from fastload.dataset import CachedLeRobotDataset
@@ -177,6 +183,68 @@ def stop_after_oom(loaders: list[FastLoader], output_dir: str | None, world: int
     os._exit(EXIT_OOM)
 
 
+class _StepSnapshot:
+    """What a single-process OOM retry of ``update_policy`` must restore, and whether it can be redone at all.
+
+    LeRobot 0.7 runs the step inside ``accelerator.accumulate(policy)`` and then steps the scheduler and the EMA. A
+    retry is exact only if nothing outlived the failed attempt: no gradient accumulation (partial gradients of
+    earlier micro-batches would be lost), and the optimizer step had not started (so no parameter, optimizer, scaler,
+    scheduler or EMA state changed). The process RNG states (the policy samples noise / time on CPU and GPU) and the
+    accelerator's step counter (``accumulate`` increments it) are restored before the retry.
+    """
+
+    def __init__(self, bound: dict[str, Any]):
+        self.accelerator = bound.get("accelerator")
+        optimizer = self.optimizer = bound.get("optimizer")
+        self.scheduler = bound.get("lr_scheduler")
+        self.ema = bound.get("ema")
+        self.rng = (torch.get_rng_state(), torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                    np.random.get_state(), random.getstate())
+        self.acc_step = getattr(self.accelerator, "step", None)
+        self.sched_epoch = getattr(self.scheduler, "last_epoch", None)
+        self.ema_updates = getattr(self.ema, "num_updates", None)
+        self.optimizer_started = False
+        self._hook = None
+        inner = getattr(optimizer, "optimizer", optimizer)  # accelerate's AcceleratedOptimizer wraps it
+        if hasattr(inner, "register_step_pre_hook"):
+            self._hook = inner.register_step_pre_hook(self._on_step)
+        self.observable = self._hook is not None
+
+    def _on_step(self, *_a, **_k):
+        self.optimizer_started = True
+
+    def close(self) -> None:
+        if self._hook is not None:
+            self._hook.remove()
+            self._hook = None
+
+    def not_retryable(self) -> str | None:
+        steps = int(getattr(self.accelerator, "gradient_accumulation_steps", 1) or 1)
+        if steps > 1:
+            return f"gradient accumulation over {steps} steps"
+        if not self.observable:
+            return "cannot observe the optimizer step"
+        if self.optimizer_started:
+            return "the optimizer step had started"
+        if getattr(self.scheduler, "last_epoch", None) != self.sched_epoch:
+            return "the LR scheduler had stepped"
+        if getattr(self.ema, "num_updates", None) != self.ema_updates:
+            return "the EMA had been updated"
+        return None
+
+    def restore(self) -> None:
+        cpu, cuda, np_state, py_state = self.rng
+        torch.set_rng_state(cpu)
+        if cuda is not None:
+            torch.cuda.set_rng_state_all(cuda)
+        np.random.set_state(np_state)
+        random.setstate(py_state)
+        if self.acc_step is not None:
+            self.accelerator.step = self.acc_step
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)  # gradients of the failed backward
+
+
 def install_hooks(fl: FastLoadConfig):
     """Patch lerobot_train in place. Returns a callable that undoes the patches."""
     import lerobot.scripts.lerobot_train as lt
@@ -192,6 +260,9 @@ def install_hooks(fl: FastLoadConfig):
 
     def make_train_eval_datasets(cfg):
         state["output_dir"] = str(cfg.output_dir) if getattr(cfg, "output_dir", None) else None
+        if getattr(cfg.dataset, "streaming", False):
+            raise SystemExit("fastload: --dataset.streaming=true is not supported (StreamingLeRobotDataset decodes "
+                             "on the fly); train from the local dataset and its fastload cache instead")
         train_ds, eval_ds = orig_make_datasets(cfg)
         train_ds = CachedLeRobotDataset.from_dataset(train_ds, fl.cache_dir)  # eval dataset: LeRobot's decoding
         logger.info(f"fastload: frames from cache {fl.cache_dir} (loader={fl.loader})")
@@ -229,15 +300,25 @@ def install_hooks(fl: FastLoadConfig):
                     augment_device=fl.augment_device,
                     persistent_workers=persistent,
                     collate_fn=kwargs.get("collate_fn"),
+                    generator=kwargs.get("generator"),
                 )
             return orig_dataloader(dataset, *args, **kwargs)
 
-    def update_policy(train_metrics, policy, batch, optimizer, *args, **kwargs):
+    update_sig = inspect.signature(orig_update_policy)
+
+    def update_policy(*args, **kwargs):
         state["steps"] = state.get("steps", 0) + 1
+        # Only a single process with a GPU tier can retry; snapshot what a retry has to restore.
+        snap = (_StepSnapshot(update_sig.bind_partial(*args, **kwargs).arguments)
+                if fl.oom_retry and any(ld.is_cuda and ld.world_size == 1 for ld in active_loaders()) else None)
         try:
-            if _debug_oom_now(state["steps"]):
-                raise torch.OutOfMemoryError(f"fastload: simulated CUDA OOM ({DEBUG_OOM_ENV})")
-            return orig_update_policy(train_metrics, policy, batch, optimizer, *args, **kwargs)
+            try:
+                if _debug_oom_now(state["steps"]):
+                    raise torch.OutOfMemoryError(f"fastload: simulated CUDA OOM ({DEBUG_OOM_ENV})")
+                return orig_update_policy(*args, **kwargs)
+            finally:
+                if snap is not None:
+                    snap.close()
         except torch.OutOfMemoryError:
             loaders = [ld for ld in active_loaders() if ld._tier.tensors]
             world = max([ld.world_size for ld in active_loaders()] or [1])
@@ -248,11 +329,17 @@ def install_hooks(fl: FastLoadConfig):
                 stop_after_oom(loaders, state.get("output_dir"), world)
             if not fl.oom_retry or not loaders:
                 raise
-            optimizer.zero_grad(set_to_none=True)
+            reason = snap.not_retryable() if snap is not None else "no snapshot of the step"
+            if reason:
+                # Redoing the step would not be the step LeRobot runs (accumulated gradients lost, optimizer / EMA
+                # / scheduler already advanced): stop and let fastload.supervise resume from the last checkpoint.
+                logger.error(f"fastload: CUDA OOM, the step cannot be redone exactly ({reason})")
+                stop_after_oom(loaders, state.get("output_dir"), world)
+            snap.restore()
             for ld in loaders:
                 ld.shrink_gpu_cache(0.5)
             logger.warning("fastload: CUDA OOM -> GPU frame tier halved, retrying the step once")
-            return orig_update_policy(train_metrics, policy, batch, optimizer, *args, **kwargs)
+            return orig_update_policy(*args, **kwargs)
 
     lt.make_train_eval_datasets = make_train_eval_datasets
     lt.update_policy = update_policy
@@ -274,6 +361,9 @@ def main(argv: list[str] | None = None) -> None:
 
     import lerobot.scripts.lerobot_train as lt
 
+    remote = getattr(lt, "_remote_target_in_argv", None)
+    if remote is not None and remote():
+        raise SystemExit("fastload: --job.target=<remote> is not supported; fastload.train runs locally")
     undo, state = install_hooks(fl)
     try:
         try:  # lerobot >= 0.4.4

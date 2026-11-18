@@ -11,8 +11,10 @@ Checks (each with ``return_uint8=True`` - lerobot_train since LeRobot 0.6, uint8
   1. CachedLeRobotDataset[i] == LeRobotDataset[i] (episode starts/ends + random frames), with an
      action chunk and a 2-frame observation history (video delta queries and padding), and the cached
      dataset decodes no video.
-  2. FastLoader.get_batch(rows) == default_collate([LeRobotDataset[i] for i in rows]) with frames
-     from the host tier only, from a partial GPU tier, and from a full GPU tier.
+  2. FastLoader.get_batch(rows) == collate(LeRobotDataset.__getitems__(rows)) (what a DataLoader calls; the
+     collate is lerobot_train's: lerobot_collate_fn, which keeps language columns as lists, for datasets with
+     language columns, else default_collate), same keys in the same order, with frames from the host tier only,
+     from a partial GPU tier, and from a full GPU tier.
   3. The same with a subset of episodes loaded (absolute -> relative index mapping).
   4. order="shard": ranks get disjoint whole episodes that cover the data, and with LeRobot's
      EpisodeAwareSampler (subset of episodes, absolute_to_relative_idx) the shards cover its rows.
@@ -46,6 +48,8 @@ def _eq(a, b, path: str, errors: list[str]) -> None:
     elif isinstance(a, dict) and isinstance(b, dict):
         if set(a) != set(b):
             errors.append(f"{path}: keys {sorted(set(a) ^ set(b))} only on one side")
+        elif list(a) != list(b):
+            errors.append(f"{path}: key order {list(a)} vs {list(b)}")
         for k in set(a) & set(b):
             _eq(a[k], b[k], f"{path}.{k}", errors)
     elif isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
@@ -62,10 +66,11 @@ def _lerobot_subset_indexing_fixed() -> bool:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     src = inspect.getsource(LeRobotDataset.__getitem__)
-    try:  # LeRobot >= 0.5 reads items in DatasetReader.get_item
+    try:  # LeRobot >= 0.5 reads items in DatasetReader.get_item (0.7: get_items)
         from lerobot.datasets.dataset_reader import DatasetReader
 
         src += inspect.getsource(DatasetReader.get_item)
+        src += inspect.getsource(getattr(DatasetReader, "get_items", DatasetReader.get_item))
     except ImportError:
         pass
     return "_get_query_indices(abs_idx" in src
@@ -112,7 +117,7 @@ def _run(repo_id: str, root: str | None, cache_dir: str, n: int, batch: int, hor
                             return_uint8=return_uint8)
         return CachedLeRobotDataset.from_dataset(ds, cache_dir) if cached else ds
 
-    # lerobot_train's collate rule: lerobot_collate_fn (drops the language columns) for datasets that have them
+    # lerobot_train's collate rule: lerobot_collate_fn (keeps the language columns as lists) for datasets with them
     from lerobot.utils.collate import lerobot_collate_fn
 
     collate = lerobot_collate_fn if meta.has_language_columns else default_collate
@@ -141,7 +146,7 @@ def _run(repo_id: str, root: str | None, cache_dir: str, n: int, batch: int, hor
             for s in range(0, len(rows), batch):
                 chunk = rows[s:s + batch]
                 got = loader.get_batch(chunk)
-                exp = collate([ref[i] for i in chunk])
+                exp = collate(ref.__getitems__([int(i) for i in chunk]))
                 _eq(got, exp, f"{tag}[{tier_name}] rows {chunk[:3]}..", errors)
             print(f"  {tag} FastLoader {tier_name}: {'OK' if not errors else 'FAIL'}"
                   + (f" (gpu tier {100 * loader.gpu_cache_fraction:.0f}%)" if tier_name != "host" else ""))
@@ -176,7 +181,7 @@ def _run(repo_id: str, root: str | None, cache_dir: str, n: int, batch: int, hor
             for name, fn in saved.items():
                 setattr(vu, name, fn)
     check_loader(ref, cached, rows, "full")
-    if meta.has_language_columns:  # default_collate on language rows is not reproduced: must be refused
+    if meta.has_language_columns:  # lerobot_train always collates them with lerobot_collate_fn: others refused
         try:
             FastLoader(cached, batch, placement="host", device="cpu", rank=0, world_size=1)
             errors.append("language columns: FastLoader accepted collate_fn=None")

@@ -138,6 +138,7 @@ def build_cache(
     cache_dir = Path(cache_dir)
     root = str(root) if root is not None else None
     ds = _open_dataset(repo_id, root, revision, video_backend, tolerance_s)
+    _lr.check_storage_format(ds.meta)
     depth = set(_lr.depth_keys(ds.meta))
     if keys:
         keys = list(keys)

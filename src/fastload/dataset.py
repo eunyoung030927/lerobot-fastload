@@ -1,4 +1,4 @@
-"""LeRobotDataset that reads camera frames from a fastload cache instead of decoding video (LeRobot 0.6.x)."""
+"""LeRobotDataset that reads camera frames from a fastload cache instead of decoding video (LeRobot 0.7.x)."""
 
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ from fastload.decode_hook import active_hook, apply_hook  # noqa: E402
 class CachedDatasetReader(DatasetReader):
     """LeRobot's DatasetReader whose ``_query_videos`` reads uint8 frames from the cache.
 
-    Everything else in ``get_item`` (parquet rows, delta timestamps, padding, image transforms, task
-    strings) is LeRobot's own code, so items are identical to the original reader's.
+    Everything else in ``get_items`` / ``get_item`` (parquet rows, delta timestamps, padding, image transforms,
+    task strings) is LeRobot's own code, so items are identical to the original reader's.
     """
 
     fastload_cache: FrameCache
@@ -52,13 +52,11 @@ class CachedDatasetReader(DatasetReader):
             hook = active_hook()
             if hook is not None:  # a wrapper around decode_video_frames (e.g. a resize) runs as with LeRobot
                 ep = self._meta.episodes[ep_idx]
-                shifted = [ep[f"videos/{key}/from_timestamp"] + ts for ts in query_ts]
+                shifted = _lr.shift_timestamps(query_ts, ep[f"videos/{key}/from_timestamp"])
                 path = self.root / self._meta.get_video_file_path(ep_idx, key)
                 frames = apply_hook(hook, raw, path, shifted, self._tolerance_s, self._video_backend, return_uint8)
-            elif return_uint8:  # LeRobot 0.6 with return_uint8=True (lerobot_train): the raw decoder output
-                frames = raw
-            else:  # same arithmetic as LeRobot's decoders: uint8 -> float32, then / 255
-                frames = raw.to(torch.float32) / 255
+            else:  # what LeRobot's decoders return: raw uint8 (return_uint8=True, lerobot_train) or float32 / 255
+                frames = _lr.normalize_rgb_frames(raw, return_uint8)
             item[key] = frames.squeeze(0)
         if fallback:
             item.update(super()._query_videos(fallback, ep_idx))
@@ -80,7 +78,11 @@ class CachedLeRobotDataset(LeRobotDataset):
         if isinstance(dataset, cls):
             return dataset
         if type(dataset) is not LeRobotDataset:
-            raise TypeError(f"Only plain LeRobotDataset is supported, got {type(dataset).__name__}.")
+            raise TypeError(
+                f"fastload: only a plain LeRobotDataset is supported, got {type(dataset).__name__} "
+                "(StreamingLeRobotDataset / --dataset.streaming=true and MultiLeRobotDataset are not supported)."
+            )
+        _lr.check_storage_format(dataset.meta)  # e.g. "lance": another reader, no hf_dataset / mp4 files
         rd = _lr.reader(dataset)
         if type(rd) is not DatasetReader:
             raise TypeError(f"Only LeRobot's DatasetReader is supported, got {type(rd).__name__}.")
