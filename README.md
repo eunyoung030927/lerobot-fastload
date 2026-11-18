@@ -33,14 +33,24 @@ Tested with LeRobot 0.4.2 and 0.4.4.
 
 ## Install
 
-Into an environment that already has LeRobot (>=0.4.2, <0.5):
+fastload hooks into LeRobot internals that change between minor releases, so there is one branch per
+LeRobot minor version. Install the branch that matches the LeRobot in your environment:
+
+| LeRobot | branch |
+|---|---|
+| 0.4.x (>=0.4.2) | `lerobot-0.4` |
+| 0.5.x | `lerobot-0.5` |
+| 0.6.x | `lerobot-0.6` |
+| 0.7.x | `lerobot-0.7` (also `main`) |
 
 ```bash
-pip install git+https://github.com/eunyoung030927/lerobot-fastload.git
+pip install git+https://github.com/eunyoung030927/lerobot-fastload.git@lerobot-0.4
 # or, to edit / run the tests and benchmarks:
-git clone https://github.com/eunyoung030927/lerobot-fastload.git
+git clone -b lerobot-0.4 https://github.com/eunyoung030927/lerobot-fastload.git
 cd lerobot-fastload && pip install -e .
 ```
+
+A branch refuses to run with another LeRobot version and prints the branch to install instead.
 
 ## 1. Build the cache (once per dataset)
 

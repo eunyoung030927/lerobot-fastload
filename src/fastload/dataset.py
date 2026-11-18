@@ -7,10 +7,15 @@ from typing import Any
 
 import numpy as np
 import torch
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from fastload.cache import FrameCache
-from fastload.decode_hook import active_hook, apply_hook
+from fastload._lerobot_version import check_lerobot_version
+
+check_lerobot_version()
+
+from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
+
+from fastload.cache import FrameCache  # noqa: E402
+from fastload.decode_hook import active_hook, apply_hook  # noqa: E402
 
 
 class CachedLeRobotDataset(LeRobotDataset):
