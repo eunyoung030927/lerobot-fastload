@@ -6,7 +6,9 @@ Usage::
         --num_workers 16
 
 Frames are decoded through LeRobot's own ``DatasetReader._query_videos`` (same backend, same timestamp
-matching), so the cache holds exactly the pixels LeRobot would have produced during training.
+matching, ``return_uint8=True`` as in ``lerobot_train``), so the cache holds exactly the pixels LeRobot would
+have produced during training. Depth cameras (``meta.depth_keys``, 12-bit / float) are not cached; datasets
+read through :class:`fastload.CachedLeRobotDataset` decode them with LeRobot's code.
 The build is resumable: finished episodes are recorded under ``progress/`` and skipped on rerun.
 """
 
@@ -48,13 +50,17 @@ def _open_dataset(repo_id: str, root: str | None, revision: str | None, video_ba
                   tolerance_s: float):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    # return_uint8=True: video frames come back as the decoder's raw uint8 (no float round trip).
     return LeRobotDataset(
-        repo_id, root=root, revision=revision, video_backend=video_backend, tolerance_s=tolerance_s
+        repo_id, root=root, revision=revision, video_backend=video_backend, tolerance_s=tolerance_s,
+        return_uint8=True,
     )
 
 
 def _to_uint8(frames: torch.Tensor) -> np.ndarray:
-    """LeRobot returns uint8/255 as float32; invert exactly."""
+    """uint8 frames as they are; float32 frames (parquet images: uint8 / 255) inverted exactly."""
+    if frames.dtype == torch.uint8:
+        return frames.numpy()
     return frames.mul(255).round_().clamp_(0, 255).to(torch.uint8).numpy()
 
 
@@ -132,12 +138,21 @@ def build_cache(
     cache_dir = Path(cache_dir)
     root = str(root) if root is not None else None
     ds = _open_dataset(repo_id, root, revision, video_backend, tolerance_s)
-    keys = list(keys) if keys else list(ds.meta.camera_keys)
-    unknown = [k for k in keys if k not in ds.meta.camera_keys]
-    if unknown:
-        raise ValueError(f"{unknown} are not camera keys of {repo_id}: {ds.meta.camera_keys}")
+    depth = set(_lr.depth_keys(ds.meta))
+    if keys:
+        keys = list(keys)
+        unknown = [k for k in keys if k not in ds.meta.camera_keys]
+        if unknown:
+            raise ValueError(f"{unknown} are not camera keys of {repo_id}: {ds.meta.camera_keys}")
+        if depth & set(keys):
+            raise ValueError(f"{sorted(depth & set(keys))} are depth cameras; fastload does not cache depth frames")
+    else:
+        keys = [k for k in ds.meta.camera_keys if k not in depth]
+        if depth:
+            logger.warning(f"{repo_id}: depth cameras {sorted(depth)} are not cached (12-bit / float frames); "
+                           "CachedLeRobotDataset decodes them with LeRobot, FastLoader refuses such datasets")
     if not keys:
-        raise ValueError(f"{repo_id} has no camera keys; nothing to cache.")
+        raise ValueError(f"{repo_id} has no (non-depth) camera keys; nothing to cache.")
 
     n = int(ds.meta.total_frames)
     hf = ds.hf_dataset.select_columns(["index", "timestamp"]).with_format("numpy")[:]
@@ -239,7 +254,7 @@ def build_cache(
 
 
 def _verify(ds, cache_dir: Path, keys: list[str], n_samples: int) -> None:
-    """Compare random frames against LeRobotDataset.__getitem__ (bit-exact)."""
+    """Compare random frames against LeRobotDataset.__getitem__ (bit-exact; ``ds`` has return_uint8=True)."""
     meta = json.loads((cache_dir / META_FILE).read_text())
     arrays = {k: np.load(cache_dir / meta["keys"][k]["file"], mmap_mode="r") for k in keys}
     rng = random.Random(0)
@@ -252,7 +267,9 @@ def _verify(ds, cache_dir: Path, keys: list[str], n_samples: int) -> None:
             item = ds[i]
             for k in keys:
                 ref = item[k]
-                got = torch.from_numpy(np.array(arrays[k][i])).to(torch.float32) / 255
+                got = torch.from_numpy(np.array(arrays[k][i]))
+                if ref.dtype != torch.uint8:  # parquet images are float32 / 255 even with return_uint8
+                    got = got.to(torch.float32) / 255
                 if not torch.equal(ref, got):
                     diff = (ref - got).abs().max().item()
                     raise RuntimeError(f"verify failed: frame {i} key {k} differs (max abs diff {diff:.3g})")

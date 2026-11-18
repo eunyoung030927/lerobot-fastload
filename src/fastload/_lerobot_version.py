@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
-BRANCH = "lerobot-0.5"
-MIN_VERSION = (0, 5, 0)  # inclusive
-MAX_VERSION = (0, 6, 0)  # exclusive
+BRANCH = "lerobot-0.6"
+MIN_VERSION = (0, 6, 0)  # inclusive
+MAX_VERSION = (0, 7, 0)  # exclusive
 REPO = "https://github.com/eunyoung030927/lerobot-fastload.git"
 
 

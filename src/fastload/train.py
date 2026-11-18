@@ -8,9 +8,12 @@ Usage: the normal lerobot-train arguments plus ``--fastload.*`` options::
 
 This runs LeRobot's own ``lerobot.scripts.lerobot_train.train`` unchanged except for three hooks:
 
-1. ``make_dataset`` returns a :class:`CachedLeRobotDataset` (frames from the cache, not video).
+1. ``make_train_eval_datasets`` (LeRobot 0.6) returns the training dataset as a :class:`CachedLeRobotDataset`
+   (frames from the cache, not video). A held-out eval dataset (``--dataset.eval_split``) stays LeRobot's.
 2. The ``DataLoader`` that train() builds for that dataset becomes a :class:`FastLoader`
-   (``--fastload.loader=dataloader`` keeps LeRobot's DataLoader and only swaps the video decoding).
+   (``--fastload.loader=dataloader`` keeps LeRobot's DataLoader and only swaps the video decoding). Its
+   ``num_workers`` / ``persistent_workers`` / ``collate_fn`` select the emulated behaviour; the eval
+   DataLoader stays a plain DataLoader.
 3. ``update_policy`` handles a CUDA OOM: one process -> halve the GPU frame tier and retry the step;
    several processes -> stop all of them at once with a note that ``python -m fastload.supervise`` uses to
    restart from the last checkpoint with a smaller tier. (FastLoader also shrinks the tier before an OOM
@@ -178,21 +181,21 @@ def install_hooks(fl: FastLoadConfig):
     """Patch lerobot_train in place. Returns a callable that undoes the patches."""
     import lerobot.scripts.lerobot_train as lt
 
-    for name in ("make_dataset", "update_policy", "train"):
+    for name in ("make_train_eval_datasets", "update_policy", "train"):
         if not hasattr(lt, name):
             raise RuntimeError(f"fastload: lerobot.scripts.lerobot_train.{name} not found; unsupported lerobot version")
 
-    orig_make_dataset = lt.make_dataset
+    orig_make_datasets = lt.make_train_eval_datasets
     orig_update_policy = lt.update_policy
     orig_dataloader = torch.utils.data.DataLoader
     state = {"fast_loaders": 0}
 
-    def make_dataset(cfg):
+    def make_train_eval_datasets(cfg):
         state["output_dir"] = str(cfg.output_dir) if getattr(cfg, "output_dir", None) else None
-        ds = orig_make_dataset(cfg)
-        ds = CachedLeRobotDataset.from_dataset(ds, fl.cache_dir)
+        train_ds, eval_ds = orig_make_datasets(cfg)
+        train_ds = CachedLeRobotDataset.from_dataset(train_ds, fl.cache_dir)  # eval dataset: LeRobot's decoding
         logger.info(f"fastload: frames from cache {fl.cache_dir} (loader={fl.loader})")
-        return ds
+        return train_ds, eval_ds
 
     class DataLoaderDispatch(orig_dataloader):  # type: ignore[misc, valid-type]
         """Constructs a FastLoader when given a CachedLeRobotDataset, a normal DataLoader otherwise."""
@@ -201,10 +204,13 @@ def install_hooks(fl: FastLoadConfig):
             if fl.loader == "fast" and isinstance(dataset, CachedLeRobotDataset):
                 state["fast_loaders"] += 1
                 sampler = kwargs.get("sampler")
-                ignored = {k: kwargs[k] for k in ("pin_memory", "prefetch_factor") if k in kwargs}
+                ignored = {k: kwargs[k] for k in ("pin_memory", "prefetch_factor", "multiprocessing_context")
+                           if k in kwargs}
                 num_workers = int(kwargs.get("num_workers", 0) or 0)
+                persistent = bool(kwargs.get("persistent_workers", False))
                 logger.info(f"fastload: FastLoader replaces DataLoader (order={fl.order}, no worker processes; "
-                            f"num_workers={num_workers} only sets the emulated worker RNG; ignoring {ignored})")
+                            f"num_workers={num_workers} persistent_workers={persistent} only set the emulated "
+                            f"worker RNG; ignoring {ignored})")
                 return FastLoader(
                     dataset,
                     batch_size=kwargs.get("batch_size", 1),
@@ -221,6 +227,8 @@ def install_hooks(fl: FastLoadConfig):
                     decode_hook_device=fl.decode_hook_device,
                     memory_guard=fl.memory_guard,
                     augment_device=fl.augment_device,
+                    persistent_workers=persistent,
+                    collate_fn=kwargs.get("collate_fn"),
                 )
             return orig_dataloader(dataset, *args, **kwargs)
 
@@ -246,12 +254,12 @@ def install_hooks(fl: FastLoadConfig):
             logger.warning("fastload: CUDA OOM -> GPU frame tier halved, retrying the step once")
             return orig_update_policy(train_metrics, policy, batch, optimizer, *args, **kwargs)
 
-    lt.make_dataset = make_dataset
+    lt.make_train_eval_datasets = make_train_eval_datasets
     lt.update_policy = update_policy
     torch.utils.data.DataLoader = DataLoaderDispatch
 
     def undo():
-        lt.make_dataset = orig_make_dataset
+        lt.make_train_eval_datasets = orig_make_datasets
         lt.update_policy = orig_update_policy
         torch.utils.data.DataLoader = orig_dataloader
 

@@ -6,13 +6,16 @@ Run as a script (recommended)::
 
 or with pytest, after exporting FASTLOAD_TEST_REPO, FASTLOAD_TEST_ROOT, FASTLOAD_TEST_CACHE.
 
-Checks
+Checks (each with ``return_uint8=True`` - lerobot_train since LeRobot 0.6, uint8 video frames - and
+``return_uint8=False``, the LeRobotDataset default)
   1. CachedLeRobotDataset[i] == LeRobotDataset[i] (episode starts/ends + random frames), with an
-     action chunk and a 2-frame observation history (video delta queries and padding).
+     action chunk and a 2-frame observation history (video delta queries and padding), and the cached
+     dataset decodes no video.
   2. FastLoader.get_batch(rows) == default_collate([LeRobotDataset[i] for i in rows]) with frames
      from the host tier only, from a partial GPU tier, and from a full GPU tier.
   3. The same with a subset of episodes loaded (absolute -> relative index mapping).
-  4. order="shard": ranks get disjoint whole episodes that cover the data.
+  4. order="shard": ranks get disjoint whole episodes that cover the data, and with LeRobot's
+     EpisodeAwareSampler (subset of episodes, absolute_to_relative_idx) the shards cover its rows.
 
 Batch order, augmentation and RNG equivalence with order="lerobot": tests/test_lerobot_order.py.
 """
@@ -82,6 +85,16 @@ def _pick_rows(ds, n: int, seed: int = 0) -> list[int]:
 
 def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int = 8, horizon: int = 50,
         backend: str | None = None, device: str | None = None) -> list[str]:
+    errors: list[str] = []
+    for return_uint8 in (True, False):
+        print(f" return_uint8={return_uint8}")
+        errors += [f"return_uint8={return_uint8}: {e}" for e in
+                   _run(repo_id, root, cache_dir, n, batch, horizon, backend, device, return_uint8)]
+    return errors
+
+
+def _run(repo_id: str, root: str | None, cache_dir: str, n: int, batch: int, horizon: int,
+         backend: str | None, device: str | None, return_uint8: bool) -> list[str]:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
     from fastload import CachedLeRobotDataset, FastLoader
@@ -95,13 +108,21 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
     errors: list[str] = []
 
     def make(episodes=None, cached=False):
-        ds = LeRobotDataset(repo_id, root=root, episodes=episodes, delta_timestamps=dt, video_backend=backend)
+        ds = LeRobotDataset(repo_id, root=root, episodes=episodes, delta_timestamps=dt, video_backend=backend,
+                            return_uint8=return_uint8)
         return CachedLeRobotDataset.from_dataset(ds, cache_dir) if cached else ds
+
+    # lerobot_train's collate rule: lerobot_collate_fn (drops the language columns) for datasets that have them
+    from lerobot.utils.collate import lerobot_collate_fn
+
+    collate = lerobot_collate_fn if meta.has_language_columns else default_collate
+    collate_fn = lerobot_collate_fn if meta.has_language_columns else None
 
     def check_loader(ref, cached, rows, tag):
         import fastload.loader as fl_loader
 
-        loader = FastLoader(cached, batch, shuffle=False, placement="host", device=device, rank=0, world_size=1)
+        loader = FastLoader(cached, batch, shuffle=False, placement="host", device=device, rank=0, world_size=1,
+                            collate_fn=collate_fn)
         tiers = [("host", None)]
         if loader.is_cuda:
             shard = len(loader.local_rows) * loader.tier_frame_bytes
@@ -120,7 +141,7 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
             for s in range(0, len(rows), batch):
                 chunk = rows[s:s + batch]
                 got = loader.get_batch(chunk)
-                exp = default_collate([ref[i] for i in chunk])
+                exp = collate([ref[i] for i in chunk])
                 _eq(got, exp, f"{tag}[{tier_name}] rows {chunk[:3]}..", errors)
             print(f"  {tag} FastLoader {tier_name}: {'OK' if not errors else 'FAIL'}"
                   + (f" (gpu tier {100 * loader.gpu_cache_fraction:.0f}%)" if tier_name != "host" else ""))
@@ -135,7 +156,9 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
     if meta.video_keys:  # the cached dataset must not decode video at all (equal items alone would not show it)
         import lerobot.datasets.video_utils as vu
 
-        names = [n for n in dir(vu) if n.startswith("decode_video_frames")]
+        # the backend decoders only: replacing video_utils.decode_video_frames itself would look like a user
+        # wrapper around it to fastload (decode_hook.active_hook)
+        names = [n for n in dir(vu) if n.startswith("decode_video_frames_")]
         saved = {n: getattr(vu, n) for n in names}
 
         def refuse(*a, **k):
@@ -153,6 +176,14 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
             for name, fn in saved.items():
                 setattr(vu, name, fn)
     check_loader(ref, cached, rows, "full")
+    if meta.has_language_columns:  # default_collate on language rows is not reproduced: must be refused
+        try:
+            FastLoader(cached, batch, placement="host", device="cpu", rank=0, world_size=1)
+            errors.append("language columns: FastLoader accepted collate_fn=None")
+        except ValueError:
+            pass
+        print(f"  language columns: lerobot_collate_fn reproduced, default collate refused: "
+              f"{'OK' if not any('language' in e for e in errors) else 'FAIL'}")
 
     # 3: subset of episodes (non-contiguous)
     if meta.total_episodes >= 4:
@@ -170,8 +201,8 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
                   "_get_query_indices (fixed in 0.4.4); FastLoader implements the fixed behaviour")
 
     # 4: sharding
-    shards = [FastLoader(cached, batch, placement="host", device="cpu", rank=r, world_size=3, order="shard")
-              for r in range(3)]
+    shards = [FastLoader(cached, batch, placement="host", device="cpu", rank=r, world_size=3, order="shard",
+                         collate_fn=collate_fn) for r in range(3)]
     all_rows = np.concatenate([s.local_rows for s in shards])
     if len(all_rows) != len(cached) or len(np.unique(all_rows)) != len(cached):
         errors.append("sharding: ranks are not a disjoint cover of the dataset")
@@ -180,6 +211,23 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
         errors.append("sharding: an episode is split across ranks")
     print(f"  sharding over 3 ranks: episodes {[len(s) for s in ep_sets]}: "
           f"{'OK' if not any('sharding' in e for e in errors) else 'FAIL'}")
+
+    # 4b: order="shard" with LeRobot's EpisodeAwareSampler on a subset (its .indices are relative rows)
+    if meta.total_episodes >= 4:
+        from lerobot.datasets.sampler import EpisodeAwareSampler
+
+        smp = EpisodeAwareSampler(cached_s.meta.episodes["dataset_from_index"],
+                                  cached_s.meta.episodes["dataset_to_index"], episode_indices_to_use=cached_s.episodes,
+                                  drop_n_last_frames=2, shuffle=True, seed=0,
+                                  absolute_to_relative_idx=cached_s.absolute_to_relative_idx)
+        expect = np.asarray(smp.indices, dtype=np.int64)
+        shards = [FastLoader(cached_s, batch, sampler=smp, placement="host", device="cpu", rank=r, world_size=2,
+                             order="shard", collate_fn=collate_fn) for r in range(2)]
+        got = np.sort(np.concatenate([s.local_rows for s in shards]))
+        ok = np.array_equal(got, np.sort(expect)) and expect.max() < len(cached_s)
+        if not ok:
+            errors.append("sharding with EpisodeAwareSampler: shard rows != sampler.indices")
+        print(f"  sharding with EpisodeAwareSampler (episodes subset, {len(expect)} rows): {'OK' if ok else 'FAIL'}")
     return errors
 
 

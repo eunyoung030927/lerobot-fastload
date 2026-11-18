@@ -11,7 +11,10 @@ takes the cached frames straight from VRAM and merges both parts. Non-image colu
 action, indices, ...) live on the GPU for the whole run.
 
 The produced batch has the same keys, dtypes and values as
-``default_collate([LeRobotDataset[i] for i in rows])``.
+``default_collate([LeRobotDataset[i] for i in rows])`` (``lerobot_collate_fn`` for datasets with language
+columns, which drops them). With ``LeRobotDataset(return_uint8=True)`` (``lerobot_train`` since LeRobot 0.6)
+video cameras are uint8 ``[.., C, H, W]`` (image transforms run on uint8, like LeRobot's workers) and the
+training loop converts them; parquet image cameras stay float32 in [0, 1].
 
 Batch order (``order``):
 
@@ -80,13 +83,19 @@ def _dist_info(device: torch.device | str | None) -> tuple[int, int, torch.devic
 
 
 def _load_columns(dataset: CachedLeRobotDataset, names: list[str]) -> dict[str, np.ndarray]:
-    """Numeric parquet columns as numpy, with LeRobot's dtypes (float -> float32, int -> int64)."""
+    """Numeric parquet columns as numpy, with LeRobot's dtypes (float -> float32, int -> int64).
+
+    Language columns (lists of message structs) are never passed here: ``lerobot_collate_fn`` drops them.
+    """
     data = dataset.hf_dataset.select_columns(names).with_format("numpy")[:]
     out = {}
     for name in names:
         arr = data[name]
         if isinstance(arr, np.ndarray) and arr.dtype == object:
-            arr = np.stack([np.asarray(x) for x in arr])
+            try:
+                arr = np.stack([np.asarray(x) for x in arr])
+            except ValueError:  # ragged / non-numeric: not a tensor column of LeRobot's batches
+                continue
         arr = np.asarray(arr)
         # hf_transform_to_torch calls torch.tensor() on python values: floats -> float32, ints -> int64.
         if arr.dtype.kind == "f":
@@ -140,6 +149,11 @@ class FastLoader:
             (per-rank episode shards); see the module docstring.
         num_workers: the ``num_workers`` of the DataLoader being reproduced (``order="lerobot"``): image
             transforms draw from the RNG streams those workers would have. No worker processes are started.
+        persistent_workers: the ``persistent_workers`` of that DataLoader (``lerobot_train``: True when
+            ``num_workers > 0``): worker RNG streams are seeded once and carry on across epochs, and later epochs
+            draw no ``base_seed``.
+        collate_fn: the DataLoader's ``collate_fn``: None / ``default_collate``, or LeRobot's
+            ``lerobot_collate_fn`` (required for datasets with language columns, which it drops).
         decode_hook_device: where a wrapper around LeRobot's ``decode_video_frames`` (e.g. a resize in the
             data loader) runs: ``"cpu"`` = exactly as LeRobot (bit-identical; those cameras skip the GPU
             tier), ``"gpu"`` = on the batch on the GPU (faster, float-rounding differences).
@@ -182,6 +196,8 @@ class FastLoader:
         decode_hook_device: str = "cpu",
         memory_guard: bool = True,
         augment_device: str = "gpu",
+        persistent_workers: bool = False,
+        collate_fn: Any = None,
     ):
         if not isinstance(dataset, CachedLeRobotDataset):
             if cache_dir is None:
@@ -195,6 +211,8 @@ class FastLoader:
             raise ValueError(f"decode_hook_device must be 'cpu' or 'gpu', got {decode_hook_device!r}")
         self.order = order
         self.num_workers = int(num_workers or 0)
+        # torch refuses persistent_workers without workers; lerobot_train only sets it when num_workers > 0.
+        self.persistent_workers = bool(persistent_workers) and self.num_workers > 0
         self.memory_guard = bool(memory_guard)
         if augment_device not in ("cpu", "gpu"):
             raise ValueError(f"augment_device must be 'cpu' or 'gpu', got {augment_device!r}")
@@ -220,12 +238,24 @@ class FastLoader:
 
         # ---- camera keys and the static per-frame tables --------------------------------------
         self.cam_keys = list(meta.camera_keys)
+        depth = _lr.depth_keys(meta)
+        if depth:
+            raise NotImplementedError(
+                f"fastload: FastLoader does not support depth cameras ({depth}): their 12-bit / float frames are "
+                "not cached. Use --fastload.loader=dataloader (CachedLeRobotDataset decodes the depth cameras "
+                "with LeRobot and reads the RGB cameras from the cache) or plain LeRobot."
+            )
+        self._check_collate(meta, collate_fn)
         self.cache.check_compatible(dataset, keys=self.cam_keys)
         self.video_keys = set(meta.video_keys)
         self.cam_shape = {k: self.cache.frame_shape(k) for k in self.cam_keys}
         self.frame_bytes = sum(self.cache.frame_nbytes(k) for k in self.cam_keys)
+        # return_uint8 (lerobot_train since 0.6): video frames stay uint8 through the decoder and the transforms.
+        self.return_uint8 = _lr.return_uint8(dataset)
+        self.raw_keys = {k for k in self.cam_keys if k in self.video_keys and self.return_uint8}
 
-        hf_names = [n for n in dataset.hf_dataset.column_names if n not in self.cam_keys]
+        skip = set(self.cam_keys) | set(_lr.LANGUAGE_COLUMNS)  # language columns: dropped by lerobot_collate_fn
+        hf_names = [n for n in dataset.hf_dataset.column_names if n not in skip]
         cols_np = _load_columns(dataset, hf_names)
         self.columns_cpu = {n: torch.from_numpy(np.ascontiguousarray(a)) for n, a in cols_np.items()
                             if a.dtype.kind in "fiub"}
@@ -233,11 +263,11 @@ class FastLoader:
         self._episode_np = cols_np["episode_index"].astype(np.int64)
         self._task_np = cols_np["task_index"].astype(np.int64) if "task_index" in cols_np else None
         self._subtask_np = (cols_np["subtask_index"].astype(np.int64)
-                            if "subtask_index" in cols_np and getattr(meta, "subtasks", None) is not None
+                            if "subtask_index" in cols_np and _lr.subtasks(meta) is not None
                             else None)
         self.task_names = ([meta.tasks.iloc[i].name for i in range(len(meta.tasks))]
                            if self._task_np is not None else [])
-        self.subtask_names = ([meta.subtasks.iloc[i].name for i in range(len(meta.subtasks))]
+        self.subtask_names = ([_lr.subtasks(meta).iloc[i].name for i in range(len(_lr.subtasks(meta)))]
                               if self._subtask_np is not None else None)
         self._ep_from_np = np.asarray(meta.episodes["dataset_from_index"], dtype=np.int64)
         self._ep_to_np = np.asarray(meta.episodes["dataset_to_index"], dtype=np.int64)
@@ -261,13 +291,16 @@ class FastLoader:
         self.hook_device = decode_hook_device
         self.hook_keys = [k for k in self.cam_keys if k in self.video_keys] if self.decode_hook else []
         self.out_shape = dict(self.cam_shape)  # per-frame [C, H, W] after the hook
+        # dtype of the frames image transforms see (and of the batch): uint8 video with return_uint8, else float32
+        self.frame_dtype = {k: torch.uint8 if k in self.raw_keys else torch.float32 for k in self.cam_keys}
         for key in self.hook_keys:
             c, h, w = self.cam_shape[key]
-            probe = self._run_hook(key, torch.zeros((1, c, h, w), dtype=torch.float32), None, [0.0])
-            if probe.dim() != 4 or probe.shape[0] != 1 or probe.dtype != torch.float32:
-                raise RuntimeError(f"fastload: decode hook returned {probe.dtype}{tuple(probe.shape)} for "
-                                   f"{key}; expected float32 [T, C, H, W]")
+            probe = self._run_hook(key, torch.zeros((1, c, h, w), dtype=torch.uint8), None, [0.0])
+            if not isinstance(probe, torch.Tensor) or probe.dim() != 4 or probe.shape[0] != 1:
+                raise RuntimeError(f"fastload: decode hook returned {getattr(probe, 'dtype', type(probe))}"
+                                   f"{tuple(getattr(probe, 'shape', ()))} for {key}; expected [T, C, H, W]")
             self.out_shape[key] = tuple(probe.shape[1:])
+            self.frame_dtype[key] = probe.dtype
         if self.hook_keys:
             logger.info(f"fastload: decode_video_frames wrapper {hook_name(self.decode_hook)} applied to cached "
                         f"frames on the {self.hook_device} "
@@ -295,14 +328,14 @@ class FastLoader:
             self.sample_shape[key] = (c, h, w) if t == 0 or squeeze else (t, c, h, w)
 
         # ---- rows this rank draws from --------------------------------------------------------
+        # EpisodeAwareSampler (lerobot_train for every map-style dataset): .indices are rows of hf_dataset.
         has_indices = sampler is not None and hasattr(sampler, "indices")
-        base_rows = (np.asarray(sampler.indices, dtype=np.int64) if has_indices
-                     else np.arange(len(dataset), dtype=np.int64))
+        base_rows = _lr.sampler_rows(sampler) if has_indices else np.arange(len(dataset), dtype=np.int64)
         self._index_loader = None
         self._prepared_index_loader = None
         if order == "lerobot":
             # Same sampler arguments as the DataLoader being replaced; it only yields row indices.
-            self._index_ds = IndexDataset(len(dataset))
+            self._index_ds = IndexDataset(len(dataset), persistent=self.persistent_workers)
             self.rng = WorkerRNG(self.num_workers)
             self._index_ds.on_new_iterator = self.rng.begin_epoch
             self._index_loader = _TorchDataLoader(
@@ -333,7 +366,9 @@ class FastLoader:
             f"fastload: rank {self.rank}/{self.world_size} order={self.order} {len(self.local_episodes)} episodes, "
             f"{len(self.local_rows)} frames ({shard_gb:.1f} GB of frames), placement={self.placement}, "
             f"device={self.device}"
-            + (f", RNG of {self.num_workers} DataLoader workers" if self.order == "lerobot" else "")
+            + (f", RNG of {self.num_workers} DataLoader workers"
+               + (" (persistent)" if self.persistent_workers else "") if self.order == "lerobot" else "")
+            + (", video frames uint8 (return_uint8)" if self.raw_keys else "")
         )
         if self.placement == "gpu":
             self.build_gpu_cache(budget_bytes=None)
@@ -536,12 +571,40 @@ class FastLoader:
     # ------------------------------------------------------------------------------------------
     # batch assembly
     # ------------------------------------------------------------------------------------------
+    @staticmethod
+    def _check_collate(meta: Any, collate_fn: Any) -> None:
+        from torch.utils.data import default_collate
+
+        lerobot_collate = _lr.language_collate_fn()
+        if _lr.has_language_columns(meta):
+            if collate_fn is not lerobot_collate:
+                raise ValueError(
+                    f"fastload: the dataset has language columns {list(_lr.LANGUAGE_COLUMNS)}; FastLoader reproduces "
+                    "lerobot_collate_fn (which drops them, as lerobot_train uses), so pass "
+                    "collate_fn=lerobot.utils.collate.lerobot_collate_fn"
+                )
+        elif collate_fn not in (None, default_collate, lerobot_collate):
+            raise NotImplementedError(f"fastload: FastLoader does not support a custom collate_fn ({collate_fn!r})")
+
     def _run_hook(self, key: str, frames: torch.Tensor, row: int | None, ts: list[float]) -> torch.Tensor:
-        """Apply the decode_video_frames wrapper to one sample's frames ``[T, C, H, W]`` (float32 in [0, 1])."""
+        """Apply the decode_video_frames wrapper to one sample's cached uint8 frames ``[T, C, H, W]``; the wrapper
+        sees what LeRobot's decoder returns (uint8 with return_uint8, else float32 in [0, 1])."""
         ds = self.dataset
         ep_idx = int(self._episode_np[row]) if row is not None else int(self._episode_np[0])
         path = ds.root / ds.meta.get_video_file_path(ep_idx, key)
-        return apply_hook(self.decode_hook, frames, path, list(ts), _lr.tolerance_s(ds), _lr.video_backend(ds))
+        return apply_hook(self.decode_hook, frames, path, list(ts), _lr.tolerance_s(ds), _lr.video_backend(ds),
+                          self.return_uint8)
+
+    def _decoded(self, key: str, raw: torch.Tensor, rows: np.ndarray, ts: list | None) -> torch.Tensor:
+        """Cached uint8 frames ``[B, T, C, H, W]`` -> what LeRobot's reader yields before squeeze / transforms:
+        the decode hook's output, raw uint8 (video, return_uint8) or float32 / 255 (decoders, ToTensor)."""
+        if key in self.hook_keys:
+            return torch.stack([self._run_hook(key, raw[i], int(rows[i]), ts[i]) for i in range(len(rows))])
+        if key in self.raw_keys:
+            return raw
+        # LeRobot computes float32(x) / 255 on CPU. On CUDA, dividing by a Python scalar is turned into
+        # x * (1/255) (1-ulp differences); a 0-dim CUDA tensor keeps a true division.
+        return raw.to(torch.float32) / (self._div255 if raw.is_cuda else 255)
 
     def _hook_timestamps(self, key: str, q: np.ndarray, ep: np.ndarray) -> list[list[float]]:
         """The timestamps LeRobot passes to decode_video_frames for each sample (episode-shifted)."""
@@ -557,8 +620,9 @@ class FastLoader:
         """Transform parameters for the ``n`` samples of a batch (cameras in LeRobot's order)."""
         if self.replayer is None:
             return None
-        rec, shapes = self.replayer.record, self.sample_shape
-        return self.rng.draw(batch_index, lambda: [{k: rec(shapes[k]) for k in self.cam_keys} for _ in range(n)])
+        rec, shapes, dtypes = self.replayer.record, self.sample_shape, self.frame_dtype
+        return self.rng.draw(batch_index,
+                             lambda: [{k: rec(shapes[k], dtypes[k]) for k in self.cam_keys} for _ in range(n)])
 
     def _squeeze(self, key: str, img: torch.Tensor) -> torch.Tensor:
         """[B, T, C, H, W] -> LeRobot's per-sample layout (no time axis without delta / for 1 video frame)."""
@@ -603,13 +667,12 @@ class FastLoader:
                 if key in self.hook_keys:
                     entry["ts"] = self._hook_timestamps(key, q, ep)
                 if self.cpu_augment:
-                    # LeRobot's exact image path on the CPU: uint8 -> float32 / 255 -> decode hook -> squeeze ->
-                    # transforms (here if the parameters are known, else in _finalize on the main thread).
+                    # LeRobot's exact image path on the CPU: cached uint8 -> decode hook / uint8 (return_uint8) /
+                    # float32 / 255 -> squeeze -> transforms (here if the parameters are known, else in _finalize on
+                    # the main thread).
                     c, h, w = self.cam_shape[key]
                     raw = torch.from_numpy(np.ascontiguousarray(self.cache.array(key)[flat]))
-                    x = (raw.to(torch.float32) / 255).view(len(rows), t, c, h, w)
-                    if key in self.hook_keys:
-                        x = torch.stack([self._run_hook(key, x[i], int(rows[i]), entry["ts"][i]) for i in range(len(rows))])
+                    x = self._decoded(key, raw.view(len(rows), t, c, h, w), rows, entry.get("ts"))
                     x = self._squeeze(key, x)
                     if ops is not None:
                         x = torch.stack([TransformReplayer.apply(x[i], ops[i][key]) for i in range(len(rows))])
@@ -619,11 +682,10 @@ class FastLoader:
                     cams[key] = entry
                     continue
                 if key in self.hook_keys and self.hook_device == "cpu":
-                    # Exactly LeRobot's data path: uint8 -> float32 / 255 -> wrapper, per sample, on the CPU.
+                    # Exactly LeRobot's data path: cached uint8 -> wrapper (as the decoder's output), per sample, CPU.
                     c, h, w = self.cam_shape[key]
                     raw = torch.from_numpy(np.ascontiguousarray(self.cache.array(key)[flat]))
-                    x = (raw.to(torch.float32) / 255).view(len(rows), t, c, h, w)
-                    y = torch.stack([self._run_hook(key, x[i], int(rows[i]), entry["ts"][i]) for i in range(len(rows))])
+                    y = self._decoded(key, raw.view(len(rows), t, c, h, w), rows, entry["ts"])
                     entry["post"] = to_dev(y, pin=True)
                     cams[key] = entry
                     continue
@@ -707,7 +769,7 @@ class FastLoader:
                     batch[key] = x.to(self.device)
                 continue
             if "post" in entry:
-                img = entry["post"]  # [B, T, C, H, W] float32, already through the decode hook on the CPU
+                img = entry["post"]  # [B, T, C, H, W], already through the decode hook on the CPU
             else:
                 c, h, w = self.cam_shape[key]
                 out = torch.empty((entry["n"], c, h, w), dtype=torch.uint8, device=self.device)
@@ -715,12 +777,8 @@ class FastLoader:
                     out.index_copy_(0, entry["host_pos"], entry["host_data"])
                 for cid, pos, off in entry.get("gpu", ()):
                     out.index_copy_(0, pos, tier.tensors[key][cid].index_select(0, off))
-                # LeRobot's decoders compute float32(x) / 255 on CPU. On CUDA, dividing by a Python scalar is
-                # turned into x * (1/255) (1-ulp differences); a 0-dim CUDA tensor keeps a true division.
-                img = (out.to(torch.float32) / self._div255).view(n_b, t, c, h, w)
-                if key in self.hook_keys:  # decode hook on the device
-                    img = torch.stack([self._run_hook(key, img[i], int(prep.rows[i]), entry["ts"][i])
-                                       for i in range(n_b)])
+                # uint8 (return_uint8 video), float32 / 255, or the decode hook on the device
+                img = self._decoded(key, out.view(n_b, t, c, h, w), prep.rows, entry.get("ts"))
             if key in self.delta:
                 q = abs_idx[:, None] + self.delta[key][None, :]
                 batch[f"{key}_is_pad"] = (q < frm[:, None]) | (q >= to[:, None])

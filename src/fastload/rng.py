@@ -2,13 +2,16 @@
 
 LeRobot draws data randomness in three places, all on the CPU:
 
-1. When a DataLoader iterator starts (every epoch), the main process draws ``base_seed`` and the sampler's
-   seed (or ``randperm``) from the global torch RNG; under multi-process accelerate the sampler gets a
-   generator that is broadcast from rank 0.
-2. Each DataLoader worker ``w`` reseeds ``random``, ``torch`` and ``numpy`` from ``base_seed + w``, and batch
-   ``k`` of an epoch is fetched by worker ``k % num_workers``. With ``num_workers=0`` the main process
-   fetches, so image transforms consume the main RNG (one batch ahead, because accelerate's
-   ``DataLoaderShard`` fetches the next batch before yielding the current one).
+1. When a DataLoader iterator starts, the main process draws ``base_seed`` from the global torch RNG, and a
+   ``RandomSampler`` draws its seed (``EpisodeAwareSampler``, which ``lerobot_train`` uses for every map-style
+   dataset since 0.6, seeds its own generator from ``(seed, epoch)`` and draws nothing). With
+   ``persistent_workers`` (``lerobot_train``'s default when ``num_workers > 0``) only the first epoch creates an
+   iterator; later epochs ``_reset`` it: no ``base_seed`` draw and no worker reseeding.
+2. Each DataLoader worker ``w`` reseeds ``random``, ``torch`` and ``numpy`` from ``base_seed + w`` when it
+   starts, and batch ``k`` of an epoch is fetched by worker ``k % num_workers`` (``_reset`` restarts the worker
+   cycle at worker 0). With ``num_workers=0`` the main process fetches, so image transforms consume the main
+   RNG (one batch ahead, because accelerate's ``DataLoaderShard`` fetches the next batch before yielding the
+   current one).
 3. ``LeRobotDataset.__getitem__`` applies ``image_transforms`` per camera, which draws the transform
    parameters (``RandomSubsetApply`` selection, ColorJitter factors, ...) from the worker's RNG.
 
@@ -77,9 +80,10 @@ class TransformReplayer:
         if not self.leaves:
             raise TypeError(f"fastload: image_transforms must be torchvision.transforms.v2 transforms, got {type(tf)}")
 
-    def record(self, shape: tuple[int, ...]) -> list[tuple[v2.Transform, dict[str, Any]]]:
+    def record(self, shape: tuple[int, ...],
+               dtype: torch.dtype = torch.float32) -> list[tuple[v2.Transform, dict[str, Any]]]:
         ops: list[tuple[v2.Transform, dict[str, Any]]] = []
-        proxy = torch.zeros((), dtype=torch.float32).expand(shape)
+        proxy = torch.zeros((), dtype=dtype).expand(shape)  # dtype of the real input (uint8 video since 0.6)
 
         def recorder(leaf):
             def _rec(inpt, params):
@@ -99,8 +103,24 @@ class TransformReplayer:
     @staticmethod
     def apply(x: torch.Tensor, ops: list[tuple[v2.Transform, dict[str, Any]]]) -> torch.Tensor:
         for leaf, params in ops:
-            x = getattr(leaf, _TRANSFORM_ATTR)(x, params)
+            if x.device.type != "cpu" and _is_seeded_noise(leaf, params, x):
+                x = _seeded_noise_cpu_draw(x, params)
+            else:
+                x = getattr(leaf, _TRANSFORM_ATTR)(x, params)
         return x
+
+
+def _is_seeded_noise(leaf: Any, params: dict[str, Any], x: torch.Tensor) -> bool:
+    """LeRobot's GaussianNoise: noise from ``torch.Generator(device=x.device).manual_seed(seed)`` (float only)."""
+    return type(leaf).__name__ == "GaussianNoise" and "seed" in params and "std" in params and x.is_floating_point()
+
+
+def _seeded_noise_cpu_draw(x: torch.Tensor, params: dict[str, Any]) -> torch.Tensor:
+    """GaussianNoise on a GPU tensor with the noise LeRobot draws on the CPU (a CUDA generator with the same seed
+    gives different numbers); the arithmetic then runs on the GPU (float rounding only)."""
+    g = torch.Generator(device="cpu").manual_seed(params["seed"])
+    noise = torch.randn(x.shape, dtype=x.dtype, generator=g).to(x.device, non_blocking=True)
+    return (x + noise * (params["std"] / 255.0)).clamp(0.0, 1.0)
 
 
 # --------------------------------------------------------------------------------------------
@@ -136,6 +156,9 @@ def _worker_state(base_seed: int, worker_id: int) -> _State:
 class WorkerRNG:
     """RNG streams of ``num_workers`` emulated DataLoader workers (0 = draw from the process RNG).
 
+    With persistent workers the streams are seeded by the first epoch only and carry on across epochs
+    (``begin_epoch(None)``; see :class:`IndexDataset`).
+
     ``private_seed`` instead gives a single stream that never touches the process RNG (used outside the
     LeRobot-order mode so that augmentation cannot shift the training RNG).
     """
@@ -147,8 +170,9 @@ class WorkerRNG:
         if private_seed is not None:
             self._states = [_worker_state(int(private_seed), 0)]
 
-    def begin_epoch(self, base_seed: int) -> None:
-        if self.private_seed is None and self.num_workers > 0:
+    def begin_epoch(self, base_seed: int | None) -> None:
+        """A new DataLoader iterator: workers start from ``base_seed`` (None = persistent workers carry on)."""
+        if self.private_seed is None and self.num_workers > 0 and base_seed is not None:
             self._states = [_worker_state(int(base_seed), w) for w in range(self.num_workers)]
 
     def draw(self, batch_index: int, fn: Callable[[], Any]) -> Any:
@@ -170,11 +194,19 @@ class WorkerRNG:
 # index DataLoader: the real sampler / accelerate sharding / base_seed draws, without loading data
 # --------------------------------------------------------------------------------------------
 class IndexDataset(Dataset):
-    """Stands in for the LeRobotDataset in a DataLoader that yields row indices only."""
+    """Stands in for the LeRobotDataset in a DataLoader that yields row indices only.
 
-    def __init__(self, n: int):
+    The index DataLoader itself has no workers. With ``persistent=True`` it emulates a DataLoader with
+    ``persistent_workers=True``: the first iterator draws ``base_seed`` as usual, later ones restore the RNG
+    that drew it (PyTorch only ``_reset``s a persistent iterator), so sampler draws and the process RNG
+    advance exactly like LeRobot's DataLoader, and ``on_new_iterator`` gets ``None`` (keep worker streams).
+    """
+
+    def __init__(self, n: int, persistent: bool = False):
         self.n = int(n)
-        self.on_new_iterator: Callable[[int], None] | None = None
+        self.persistent = bool(persistent)
+        self.iterators = 0  # iterators created so far (epochs started)
+        self.on_new_iterator: Callable[[int | None], None] | None = None
 
     def __len__(self) -> int:
         return self.n
@@ -191,10 +223,25 @@ _orig_iter_init = _dl._BaseDataLoaderIter.__init__
 
 
 def _iter_init(self, loader):
-    _orig_iter_init(self, loader)
     ds = loader.dataset
-    if isinstance(ds, IndexDataset) and ds.on_new_iterator is not None:
-        ds.on_new_iterator(int(self._base_seed))
+    if not isinstance(ds, IndexDataset):
+        return _orig_iter_init(self, loader)
+    reuse = ds.persistent and ds.iterators > 0
+    gen = loader.generator
+    saved = None
+    if reuse:
+        # A persistent iterator is reset, not rebuilt: undo this new iterator's base_seed draw. Nothing else in
+        # __init__ draws (sampler iterators draw only when advanced).
+        saved = gen.get_state() if gen is not None else torch.get_rng_state()
+    _orig_iter_init(self, loader)
+    if saved is not None:
+        if gen is not None:
+            gen.set_state(saved)
+        else:
+            torch.set_rng_state(saved)
+    ds.iterators += 1
+    if ds.on_new_iterator is not None:
+        ds.on_new_iterator(None if reuse else int(self._base_seed))
 
 
 if not getattr(_dl._BaseDataLoaderIter.__init__, "_fastload", False):

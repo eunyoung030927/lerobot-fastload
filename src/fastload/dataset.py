@@ -1,4 +1,4 @@
-"""LeRobotDataset that reads camera frames from a fastload cache instead of decoding video (LeRobot 0.5.x)."""
+"""LeRobotDataset that reads camera frames from a fastload cache instead of decoding video (LeRobot 0.6.x)."""
 
 from __future__ import annotations
 
@@ -39,22 +39,26 @@ class CachedDatasetReader(DatasetReader):
         cache = self.fastload_cache
         start, end = int(self._fl_ep_from[ep_idx]), int(self._fl_ep_to[ep_idx])
         ep_ts = cache.timestamps[start:end]
+        return_uint8 = bool(getattr(self, "_return_uint8", False))
         item: dict[str, torch.Tensor] = {}
         fallback: dict[str, list[float]] = {}
         for key, query_ts in query_timestamps.items():
-            if key not in cache.keys:
+            if key not in cache.keys:  # e.g. depth cameras: LeRobot's own decoding
                 fallback[key] = query_ts
+                item[key] = None  # type: ignore[assignment]  # keeps LeRobot's key order
                 continue
             rel = _nearest(ep_ts, np.asarray(query_ts, dtype=np.float64), self._tolerance_s, key, ep_idx)
-            frames = np.asarray(cache.array(key)[start + rel])  # [T, C, H, W] uint8 copy
-            # Same arithmetic as LeRobot's decoders: uint8 -> float32, then / 255.
-            frames = torch.from_numpy(frames).to(torch.float32) / 255
+            raw = torch.from_numpy(np.asarray(cache.array(key)[start + rel]))  # [T, C, H, W] uint8 copy
             hook = active_hook()
             if hook is not None:  # a wrapper around decode_video_frames (e.g. a resize) runs as with LeRobot
                 ep = self._meta.episodes[ep_idx]
                 shifted = [ep[f"videos/{key}/from_timestamp"] + ts for ts in query_ts]
                 path = self.root / self._meta.get_video_file_path(ep_idx, key)
-                frames = apply_hook(hook, frames, path, shifted, self._tolerance_s, self._video_backend)
+                frames = apply_hook(hook, raw, path, shifted, self._tolerance_s, self._video_backend, return_uint8)
+            elif return_uint8:  # LeRobot 0.6 with return_uint8=True (lerobot_train): the raw decoder output
+                frames = raw
+            else:  # same arithmetic as LeRobot's decoders: uint8 -> float32, then / 255
+                frames = raw.to(torch.float32) / 255
             item[key] = frames.squeeze(0)
         if fallback:
             item.update(super()._query_videos(fallback, ep_idx))
@@ -81,7 +85,9 @@ class CachedLeRobotDataset(LeRobotDataset):
         if type(rd) is not DatasetReader:
             raise TypeError(f"Only LeRobot's DatasetReader is supported, got {type(rd).__name__}.")
         cache = FrameCache(cache_dir)
-        cache.check_compatible(dataset, keys=list(dataset.meta.video_keys))
+        # Depth cameras are not cached (12-bit / float frames): the reader decodes them with LeRobot's code.
+        depth = set(_lr.depth_keys(dataset.meta))
+        cache.check_compatible(dataset, keys=[k for k in dataset.meta.video_keys if k not in depth])
         dataset.__class__ = cls
         dataset.fastload_cache = cache
         dataset._fastload_wrap_reader(rd)

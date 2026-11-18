@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 dependencies = [
-    "lerobot>=0.5,<0.6",
+    "lerobot>=0.6,<0.7",
     "numpy",
     "torch",
 ]
