@@ -94,7 +94,8 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg):
     else:
         ds = CachedLeRobotDataset.from_dataset(ds, args.cache_dir)
         dl = FastLoader(ds, order="lerobot", num_workers=num_workers, placement=args.placement,
-                        device=accelerator.device, decode_hook_device=args.hook_device, **common)
+                        device=accelerator.device, decode_hook_device=args.hook_device,
+                        augment_device=args.augment_device, **common)
     dl = accelerator.prepare(dl)
 
     batches, states = [], []
@@ -158,6 +159,8 @@ def main() -> int:
                    help="wrap LeRobot's decode_video_frames with a half-size bilinear antialiased resize "
                         "(like a data-loader resize in a training script)")
     p.add_argument("--hook_device", choices=["cpu", "gpu"], default="cpu")
+    p.add_argument("--augment_device", choices=["cpu", "gpu"], default="gpu",
+                   help="cpu: augmented images must match LeRobot bit for bit (use with --atol 0)")
     args = p.parse_args()
 
     import subprocess

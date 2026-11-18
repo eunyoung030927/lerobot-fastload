@@ -58,6 +58,9 @@ class FastLoadConfig:
     # A wrapper around LeRobot's decode_video_frames (e.g. a data-loader resize) runs on the
     # "cpu" (bit-identical to LeRobot) or on the "gpu" (faster, float-rounding differences).
     decode_hook_device: str = "cpu"
+    # Image transforms (augmentation) on the "gpu" (fast; pixels differ from LeRobot by float rounding)
+    # or on the "cpu" (LeRobot's exact path in the prefetch thread: bit-identical, no VRAM tier).
+    augment_device: str = "gpu"
     # Check free VRAM every step and drop GPU-tier chunks before the model runs out of memory.
     memory_guard: bool = True
     # CUDA OOM in a step: one process -> halve the GPU tier and retry the step; several processes -> stop all
@@ -71,6 +74,8 @@ class FastLoadConfig:
             raise SystemExit(f"fastload: --fastload.loader must be fast|dataloader, got {self.loader}")
         if self.order not in ORDERS:
             raise SystemExit(f"fastload: --fastload.order must be one of {ORDERS}, got {self.order}")
+        if self.augment_device not in ("cpu", "gpu"):
+            raise SystemExit(f"fastload: --fastload.augment_device must be cpu|gpu, got {self.augment_device}")
         if self.decode_hook_device not in ("cpu", "gpu"):
             raise SystemExit(f"fastload: --fastload.decode_hook_device must be cpu|gpu, got {self.decode_hook_device}")
         if self.placement not in PLACEMENTS:
@@ -215,6 +220,7 @@ def install_hooks(fl: FastLoadConfig):
                     num_workers=num_workers,
                     decode_hook_device=fl.decode_hook_device,
                     memory_guard=fl.memory_guard,
+                    augment_device=fl.augment_device,
                 )
             return orig_dataloader(dataset, *args, **kwargs)
 

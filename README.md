@@ -78,6 +78,7 @@ accelerate launch --num_processes 8 -m fastload.train \
 | `--fastload.prefetch` | 2 | batches prepared ahead |
 | `--fastload.memory_guard` | true | every step, drop VRAM-tier chunks if the run's peak memory grew into the margin |
 | `--fastload.oom_retry` | true | CUDA OOM in a step: one process -> halve the VRAM tier and retry; several -> stop all ranks at once and leave a note for `fastload.supervise` |
+| `--fastload.augment_device` | `gpu` | where image augmentation runs: `gpu` = fast, augmented pixels differ from LeRobot by float rounding (~1e-6); `cpu` = LeRobot's exact CPU path in the prefetch thread, bit-identical, no VRAM tier |
 | `--fastload.decode_hook_device` | `cpu` | where a wrapper around LeRobot's `decode_video_frames` (e.g. a data-loader resize) runs: `cpu` = bit-identical to LeRobot, `gpu` = faster, float rounding |
 
 With `loader=fast` no worker processes are started: `num_workers` only selects the emulated worker RNG
@@ -122,7 +123,7 @@ waiting for data: compare LeRobot's `data_s` with `updt_s` in the training log b
 | `base_seed` and sampler seed drawn from the process RNG when each epoch starts | the same draws, at the same point |
 | worker `w` reseeds `torch` / `numpy` / `random` from `base_seed + w`; batch `k` is fetched by worker `k % num_workers` | the same streams, emulated in the main thread (no worker processes) |
 | `num_workers=0`: transforms draw from the process RNG, one batch ahead (accelerate prefetches) | the same |
-| `image_transforms` per sample and camera on the CPU | same parameters; kernels run on the GPU (float rounding differences, ~1e-7) |
+| `image_transforms` per sample and camera on the CPU | same parameters; kernels on the GPU (float rounding, ~1e-6) or, with `--fastload.augment_device=cpu`, LeRobot's CPU path (bit-identical) |
 
 With several GPUs every rank's batches come from the whole dataset, so the VRAM tier is a random subset
 of all frames and the rest is read from RAM / disk each batch.
@@ -168,8 +169,11 @@ otherwise).
 ## Limitations
 
 * Single `LeRobotDataset` (as `lerobot-train`); `StreamingLeRobotDataset` is not supported.
-* Image transforms must be torchvision v2 transforms (LeRobot's are). Their parameters match LeRobot's;
-  the kernels run on the GPU, so augmented pixels can differ from LeRobot's CPU result by float rounding.
+* Image transforms must be torchvision v2 transforms (LeRobot's are). Their parameters match LeRobot's; with
+  the default `augment_device=gpu` augmented pixels can differ from LeRobot's CPU result by float rounding
+  (`augment_device=cpu` makes them bit-identical at the cost of the VRAM tier and CPU time).
+* `cudnn.benchmark` (on in lerobot-train) picks convolution algorithms at run time, and the choice can depend
+  on free GPU memory, which the VRAM tier changes.
 * `order=lerobot` follows `persistent_workers=False` (LeRobot's setting) and a `cycle()` that finishes each
   epoch before starting the next.
 * GPU kernels themselves are not deterministic by default (`cudnn.benchmark`, atomics), in LeRobot too.

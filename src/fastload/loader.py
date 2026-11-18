@@ -120,6 +120,7 @@ class _Prepared:
     event: Any = None
     keepalive: list[torch.Tensor] = field(default_factory=list)
     batch_index: int = -1
+    ops: Any = None  # image-transform parameters already applied on the CPU (augment_device="cpu")
 
 
 # --------------------------------------------------------------------------------------------
@@ -143,6 +144,9 @@ class FastLoader:
             tier), ``"gpu"`` = on the batch on the GPU (faster, float-rounding differences).
         memory_guard: after the GPU tier exists, check free VRAM every step and drop tier chunks before the
             model runs out of memory (the peak use of the run can grow after the tier was sized).
+        augment_device: where image transforms run: ``"gpu"`` = on the batch on the GPU (fast; augmented pixels
+            differ from LeRobot's CPU result by float rounding), ``"cpu"`` = LeRobot's exact CPU path in the
+            prefetch thread (bit-identical; no GPU tier).
         placement: ``"auto"`` - grow a GPU tier after ``warmup_steps`` batches, sized from the measured
             peak memory of the run; ``"gpu"`` - put this rank's whole shard on the GPU now;
             ``"host"`` - never use VRAM for frames.
@@ -176,6 +180,7 @@ class FastLoader:
         num_workers: int = 0,
         decode_hook_device: str = "cpu",
         memory_guard: bool = True,
+        augment_device: str = "gpu",
     ):
         if not isinstance(dataset, CachedLeRobotDataset):
             if cache_dir is None:
@@ -190,6 +195,8 @@ class FastLoader:
         self.order = order
         self.num_workers = int(num_workers or 0)
         self.memory_guard = bool(memory_guard)
+        if augment_device not in ("cpu", "gpu"):
+            raise ValueError(f"augment_device must be 'cpu' or 'gpu', got {augment_device!r}")
         r, w, dev = _dist_info(device)
         self.rank = r if rank is None else rank
         self.world_size = w if world_size is None else world_size
@@ -273,6 +280,12 @@ class FastLoader:
         # ---- image transforms: parameters drawn on the CPU, kernels applied on the device -------
         tf = dataset.image_transforms
         self.replayer = TransformReplayer(tf) if tf is not None else None
+        # augment_device="cpu": images take LeRobot's exact path (uint8 -> float32 / 255 -> decode hook ->
+        # transforms, all on the CPU), so they are bit-identical; no camera can use the GPU tier then.
+        self.cpu_augment = self.replayer is not None and augment_device == "cpu"
+        if self.cpu_augment:
+            self.tier_keys, self.tier_frame_bytes, self.placement = [], 0, "host"
+            logger.info("fastload: image transforms on the CPU (bit-identical to LeRobot; GPU tier off)")
         self.sample_shape = {}
         for key in self.cam_keys:
             c, h, w = self.out_shape[key]
@@ -546,7 +559,13 @@ class FastLoader:
         rec, shapes = self.replayer.record, self.sample_shape
         return self.rng.draw(batch_index, lambda: [{k: rec(shapes[k]) for k in self.cam_keys} for _ in range(n)])
 
-    def _prepare(self, rows: np.ndarray, batch_index: int = -1) -> _Prepared:
+    def _squeeze(self, key: str, img: torch.Tensor) -> torch.Tensor:
+        """[B, T, C, H, W] -> LeRobot's per-sample layout (no time axis without delta / for 1 video frame)."""
+        if key in self.delta_np:
+            return img[:, 0] if key in self.video_keys and img.shape[1] == 1 else img
+        return img[:, 0]
+
+    def _prepare(self, rows: np.ndarray, batch_index: int = -1, ops: list | None = None) -> _Prepared:
         """CPU work + host->GPU copies for one batch (runs in the background thread)."""
         tier = self._tier
         abs_idx = self._index_np[rows]
@@ -582,6 +601,22 @@ class FastLoader:
                 entry: dict[str, Any] = {"t": t, "n": flat.shape[0]}
                 if key in self.hook_keys:
                     entry["ts"] = self._hook_timestamps(key, q, ep)
+                if self.cpu_augment:
+                    # LeRobot's exact image path on the CPU: uint8 -> float32 / 255 -> decode hook -> squeeze ->
+                    # transforms (here if the parameters are known, else in _finalize on the main thread).
+                    c, h, w = self.cam_shape[key]
+                    raw = torch.from_numpy(np.ascontiguousarray(self.cache.array(key)[flat]))
+                    x = (raw.to(torch.float32) / 255).view(len(rows), t, c, h, w)
+                    if key in self.hook_keys:
+                        x = torch.stack([self._run_hook(key, x[i], int(rows[i]), entry["ts"][i]) for i in range(len(rows))])
+                    x = self._squeeze(key, x)
+                    if ops is not None:
+                        x = torch.stack([TransformReplayer.apply(x[i], ops[i][key]) for i in range(len(rows))])
+                        entry["final"] = to_dev(x, pin=True)
+                    else:
+                        entry["cpu_img"] = x
+                    cams[key] = entry
+                    continue
                 if key in self.hook_keys and self.hook_device == "cpu":
                     # Exactly LeRobot's data path: uint8 -> float32 / 255 -> wrapper, per sample, on the CPU.
                     c, h, w = self.cam_shape[key]
@@ -612,7 +647,8 @@ class FastLoader:
                 event = torch.cuda.Event()
                 event.record(self._copy_stream)
         return _Prepared(rows=rows, tier=tier, rows_dev=rows_dev, tasks=tasks,
-                         subtasks=subtasks, cams=cams, event=event, keepalive=keep, batch_index=batch_index)
+                         subtasks=subtasks, cams=cams, event=event, keepalive=keep, batch_index=batch_index,
+                         ops=ops)
 
     def _sync(self, prep: _Prepared) -> None:
         """Make the training stream wait for the side-stream copies of ``prep``."""
@@ -621,7 +657,7 @@ class FastLoader:
         cur = torch.cuda.current_stream(self.device)
         cur.wait_event(prep.event)
         for entry in prep.cams.values():
-            for name in ("host_pos", "host_data", "post"):
+            for name in ("host_pos", "host_data", "post", "final"):
                 if name in entry:
                     entry[name].record_stream(cur)
             for _, pos, off in entry.get("gpu", ()):
@@ -632,7 +668,7 @@ class FastLoader:
     def _finalize(self, prep: _Prepared, ops: list[dict[str, list]] | None = None) -> dict[str, Any]:
         """GPU-side gathers on the training stream; returns the collated batch."""
         if prep.tier.released:  # its GPU tier was freed or shrunk: rebuild the batch from the host tier
-            prep = self._prepare(prep.rows, prep.batch_index)
+            prep = self._prepare(prep.rows, prep.batch_index, prep.ops)
         self._sync(prep)
         tier = prep.tier
 
@@ -653,11 +689,22 @@ class FastLoader:
             else:
                 batch[name] = col[rows]
 
-        if self.replayer is not None and ops is None:
+        if self.replayer is not None and ops is None and prep.ops is None:
             raise RuntimeError("fastload: image transforms are enabled but no parameters were drawn for this batch")
         for key in self.cam_keys:
             entry = prep.cams[key]
             t = entry["t"]
+            if "final" in entry or "cpu_img" in entry:  # augment_device="cpu": LeRobot's CPU path
+                if key in self.delta:
+                    q = abs_idx[:, None] + self.delta[key][None, :]
+                    batch[f"{key}_is_pad"] = (q < frm[:, None]) | (q >= to[:, None])
+                if "final" in entry:
+                    batch[key] = entry["final"]
+                else:  # num_workers=0: parameters come from the process RNG at LeRobot's time (main thread)
+                    x = entry["cpu_img"]
+                    x = torch.stack([TransformReplayer.apply(x[i], ops[i][key]) for i in range(n_b)])
+                    batch[key] = x.to(self.device)
+                continue
             if "post" in entry:
                 img = entry["post"]  # [B, T, C, H, W] float32, already through the decode hook on the CPU
             else:
@@ -735,6 +782,14 @@ class _EpochIterator:
             self.batches = [rows[i * bs:(i + 1) * bs] for i in range(n_batches)]
         self._served = 0
         self._ops: dict[int, list] = {}
+        # augment_device="cpu": the prefetch thread applies the transforms, so it needs the parameters up front.
+        # Worker RNG streams (num_workers > 0) and the private stream do not depend on when they are drawn,
+        # so the whole epoch is drawn here; with num_workers=0 LeRobot draws from the process RNG during
+        # each step, so those batches are transformed on the main thread instead.
+        self._pre_ops = None
+        rng = loader.rng
+        if loader.cpu_augment and (rng.private_seed is not None or rng.num_workers > 0):
+            self._pre_ops = [loader._draw_ops(i, len(b)) for i, b in enumerate(self.batches)]
         self._queue: queue.Queue = queue.Queue(maxsize=loader.prefetch)
         self._stop = threading.Event()
         self._pending: list[tuple[int, np.ndarray]] = []
@@ -754,7 +809,8 @@ class _EpochIterator:
     def _produce(self) -> None:
         try:
             for i, rows in enumerate(self.batches):
-                if self._stop.is_set() or not self._put(self.loader._prepare(rows, i)):
+                pre = self._pre_ops[i] if self._pre_ops is not None else None
+                if self._stop.is_set() or not self._put(self.loader._prepare(rows, i, pre)):
                     return
             self._put(StopIteration)
         except BaseException as e:  # surface errors in the training thread
@@ -794,7 +850,7 @@ class _EpochIterator:
         accelerate's DataLoaderShard fetches batch k+1 before yielding batch k, so with
         ``num_workers=0`` LeRobot draws batch k+1's parameters during the step that returns batch k.
         """
-        if self.loader.replayer is None:
+        if self.loader.replayer is None or self._pre_ops is not None:
             return None
         for j in (k, k + 1):
             if j < len(self.batches) and j not in self._ops:
@@ -806,7 +862,8 @@ class _EpochIterator:
         if self._pending:
             idx, rows = self._pending.pop(0)
             assert idx == k, (idx, k)
-            batch = self.loader._finalize(self.loader._prepare(rows, idx), self._ops_for(k))
+            pre = self._pre_ops[idx] if self._pre_ops is not None else None
+            batch = self.loader._finalize(self.loader._prepare(rows, idx, pre), self._ops_for(k))
         else:
             item = self._queue.get()
             if item is StopIteration:
