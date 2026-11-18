@@ -262,3 +262,14 @@ class FrameCache:
         missing = [k for k in (keys or []) if k not in self.keys]
         if missing:
             raise RuntimeError(f"Cache {self.cache_dir} has no frames for {missing}; rebuild with these keys.")
+        built = self.meta.get("video_backend")
+        used = getattr(dataset, "_video_backend", None) or getattr(dataset, "video_backend", None)
+        if getattr(dataset.meta, "video_keys", None) and built and isinstance(used, str) and built != used:
+            import logging
+
+            logging.warning(
+                f"fastload: cache {self.cache_dir} was decoded with video_backend={built!r} but this dataset uses "
+                f"{used!r}; the two decoders can give slightly different pixels, so batches may not match plain "
+                f"LeRobot. Rebuild with `build_cache ... --video_backend {used}` (or pass "
+                f"--dataset.video_backend={built} to training)."
+            )
