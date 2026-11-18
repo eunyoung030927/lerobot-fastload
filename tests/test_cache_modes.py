@@ -171,6 +171,8 @@ def test_restart(data: Data, work: Path) -> list[str]:
     ref = run("lerobot", a2, acc, 2, "episode_aware", tf)
     got = run("fast", a2, acc, 2, "episode_aware", tf)
     errors += compare(ref, got, ref[2], 0.0)
+    if LAST_RUN.get("fill_stats_final") is None:  # the cache was complete when run 2 started
+        return errors + ["run 2 had nothing to fill (cache complete after run 1)"]
     decoded2 = LAST_RUN["fill_stats_final"]["frames"]  # the epochs plus the rest finish_cache() decoded
     print(f"    run 2: decoded {decoded2} frames (missing after run 1: {n - filled1}), epoch times "
           f"{', '.join(f'{x:.2f}s' for x in LAST_RUN['epoch_s'])}")
