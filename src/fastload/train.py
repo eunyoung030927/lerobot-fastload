@@ -11,7 +11,10 @@ This runs LeRobot's own ``lerobot.scripts.lerobot_train.train`` unchanged except
 1. ``make_dataset`` returns a :class:`CachedLeRobotDataset` (frames from the cache, not video).
 2. The ``DataLoader`` that train() builds for that dataset becomes a :class:`FastLoader`
    (``--fastload.loader=dataloader`` keeps LeRobot's DataLoader and only swaps the video decoding).
-3. ``update_policy`` retries once after a CUDA OOM by shrinking the GPU frame tier (single process).
+3. ``update_policy`` handles a CUDA OOM: one process -> halve the GPU frame tier and retry the step;
+   several processes -> stop all of them at once with a note that ``python -m fastload.supervise`` uses to
+   restart from the last checkpoint with a smaller tier. (FastLoader also shrinks the tier before an OOM
+   when the run's peak memory grows; see ``memory_guard``.)
 
 Checkpoints, train_config.json, logging, eval and resume are LeRobot's; ``--fastload.*`` options are
 not written into train_config.json, so checkpoints stay loadable by plain LeRobot.
@@ -20,9 +23,13 @@ not written into train_config.json, so checkpoints stay loadable by plain LeRobo
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
+import os
 import sys
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -48,6 +55,13 @@ class FastLoadConfig:
     gpu_margin_gb: float | None = None
     max_gpu_cache_gb: float | None = None
     prefetch: int = 2
+    # A wrapper around LeRobot's decode_video_frames (e.g. a data-loader resize) runs on the
+    # "cpu" (bit-identical to LeRobot) or on the "gpu" (faster, float-rounding differences).
+    decode_hook_device: str = "cpu"
+    # Check free VRAM every step and drop GPU-tier chunks before the model runs out of memory.
+    memory_guard: bool = True
+    # CUDA OOM in a step: one process -> halve the GPU tier and retry the step; several processes -> stop all
+    # of them at once and leave a note for `python -m fastload.supervise` to restart from the last checkpoint.
     oom_retry: bool = True
 
     def validate(self) -> None:
@@ -57,6 +71,8 @@ class FastLoadConfig:
             raise SystemExit(f"fastload: --fastload.loader must be fast|dataloader, got {self.loader}")
         if self.order not in ORDERS:
             raise SystemExit(f"fastload: --fastload.order must be one of {ORDERS}, got {self.order}")
+        if self.decode_hook_device not in ("cpu", "gpu"):
+            raise SystemExit(f"fastload: --fastload.decode_hook_device must be cpu|gpu, got {self.decode_hook_device}")
         if self.placement not in PLACEMENTS:
             raise SystemExit(f"fastload: --fastload.placement must be one of {PLACEMENTS}, got {self.placement}")
 
@@ -98,6 +114,61 @@ def split_args(argv: list[str]) -> tuple[FastLoadConfig, list[str]]:
     return cfg, rest
 
 
+EXIT_OOM = 86  # exit status of a rank stopped by stop_after_oom (fastload.supervise looks for it)
+NOTE_DIR_ENV = "FASTLOAD_SUPERVISE_DIR"
+# Testing only: "RANK:STEP" raises a CUDA OOM on that rank at that step of a fresh (not resumed) run.
+DEBUG_OOM_ENV = "FASTLOAD_DEBUG_OOM"
+
+
+def _debug_oom_now(step: int) -> bool:
+    spec = os.environ.get(DEBUG_OOM_ENV)
+    if not spec or any(a.startswith("--resume") and a.endswith("true") for a in sys.argv):
+        return False
+    rank, at = (int(x) for x in spec.split(":"))
+    return int(os.environ.get("RANK", 0)) == rank and step == at
+
+
+def oom_note_dir(output_dir: str | None) -> Path | None:
+    d = os.environ.get(NOTE_DIR_ENV)
+    if d:
+        return Path(d)
+    return Path(output_dir) / "fastload_oom" if output_dir else None
+
+
+def stop_after_oom(loaders: list[FastLoader], output_dir: str | None, world: int) -> None:
+    """Write an OOM note for fastload.supervise and terminate this rank immediately (never returns)."""
+    rank = loaders[0].rank if loaders else int(os.environ.get("RANK", 0))
+    tier_bytes = int(sum(ld._tier.nbytes for ld in loaders))
+    tier_gb = tier_bytes / 1e9
+    note = {
+        "rank": rank,
+        "world_size": world,
+        "output_dir": output_dir,
+        "gpu_tier_bytes": tier_bytes,
+        "time": time.time(),
+    }
+    d = oom_note_dir(output_dir)
+    if d is not None:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"rank{rank}.json").write_text(json.dumps(note))
+        except OSError as e:  # pragma: no cover
+            logger.error(f"fastload: could not write the OOM note to {d}: {e}")
+    logger.error(
+        f"fastload: rank {rank}: CUDA OOM during a multi-process step (GPU tier {tier_gb:.1f} GB). Stopping all "
+        f"processes; restart from the last checkpoint with --fastload.max_gpu_cache_gb={tier_gb / 2:.4g} "
+        "(python -m fastload.supervise does this automatically)"
+    )
+    for h in logging.getLogger().handlers + logger.handlers:
+        try:
+            h.flush()
+        except Exception:  # pragma: no cover
+            pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(EXIT_OOM)
+
+
 def install_hooks(fl: FastLoadConfig):
     """Patch lerobot_train in place. Returns a callable that undoes the patches."""
     import lerobot.scripts.lerobot_train as lt
@@ -112,6 +183,7 @@ def install_hooks(fl: FastLoadConfig):
     state = {"fast_loaders": 0}
 
     def make_dataset(cfg):
+        state["output_dir"] = str(cfg.output_dir) if getattr(cfg, "output_dir", None) else None
         ds = orig_make_dataset(cfg)
         ds = CachedLeRobotDataset.from_dataset(ds, fl.cache_dir)
         logger.info(f"fastload: frames from cache {fl.cache_dir} (loader={fl.loader})")
@@ -141,19 +213,26 @@ def install_hooks(fl: FastLoadConfig):
                     prefetch=fl.prefetch,
                     order=fl.order,
                     num_workers=num_workers,
+                    decode_hook_device=fl.decode_hook_device,
+                    memory_guard=fl.memory_guard,
                 )
             return orig_dataloader(dataset, *args, **kwargs)
 
     def update_policy(train_metrics, policy, batch, optimizer, *args, **kwargs):
+        state["steps"] = state.get("steps", 0) + 1
         try:
+            if _debug_oom_now(state["steps"]):
+                raise torch.OutOfMemoryError(f"fastload: simulated CUDA OOM ({DEBUG_OOM_ENV})")
             return orig_update_policy(train_metrics, policy, batch, optimizer, *args, **kwargs)
         except torch.OutOfMemoryError:
             loaders = [ld for ld in active_loaders() if ld._tier.tensors]
-            world = loaders[0].world_size if loaders else 1
-            if not fl.oom_retry or not loaders or world > 1:
-                if loaders and world > 1:
-                    logger.error("fastload: OOM with a GPU frame tier under multi-process training; rerun with "
-                                 "a larger --fastload.gpu_margin_gb or --fastload.max_gpu_cache_gb")
+            world = max([ld.world_size for ld in active_loaders()] or [1])
+            if world > 1 and fl.oom_retry:
+                # The other ranks are already waiting in this step's gradient all-reduce, so this rank cannot
+                # redo the step alone. Stop every process now (instead of after the NCCL timeout) and leave
+                # a note so `python -m fastload.supervise` restarts from the last checkpoint with a smaller tier.
+                stop_after_oom(loaders, state.get("output_dir"), world)
+            if not fl.oom_retry or not loaders:
                 raise
             optimizer.zero_grad(set_to_none=True)
             for ld in loaders:

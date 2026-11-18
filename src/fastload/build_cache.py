@@ -120,6 +120,13 @@ def build_cache(
     overwrite: bool = False,
 ) -> Path:
     """Build (or resume building) the cache for one LeRobot dataset. Returns the cache dir."""
+    from fastload.decode_hook import active_hook, hook_name
+
+    if active_hook() is not None:
+        raise RuntimeError(
+            f"fastload: decode_video_frames is wrapped ({hook_name(active_hook())}); build the cache in a process "
+            "without the wrapper. The cache stores the decoder's own frames and the wrapper is applied at training time."
+        )
     cache_dir = Path(cache_dir)
     root = str(root) if root is not None else None
     ds = _open_dataset(repo_id, root, revision, video_backend, tolerance_s)

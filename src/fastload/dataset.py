@@ -10,6 +10,7 @@ import torch
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from fastload.cache import FrameCache
+from fastload.decode_hook import active_hook, apply_hook
 
 
 class CachedLeRobotDataset(LeRobotDataset):
@@ -60,7 +61,14 @@ class CachedLeRobotDataset(LeRobotDataset):
             rel = _nearest(ep_ts, np.asarray(query_ts, dtype=np.float64), self.tolerance_s, key, ep_idx)
             frames = np.asarray(cache.array(key)[start + rel])  # [T, C, H, W] uint8 copy
             # Same arithmetic as LeRobot's decoders: uint8 -> float32, then / 255.
-            item[key] = (torch.from_numpy(frames).to(torch.float32) / 255).squeeze(0)
+            frames = torch.from_numpy(frames).to(torch.float32) / 255
+            hook = active_hook()
+            if hook is not None:  # a wrapper around decode_video_frames (e.g. a resize) runs as with LeRobot
+                ep = self.meta.episodes[ep_idx]
+                shifted = [ep[f"videos/{key}/from_timestamp"] + ts for ts in query_ts]
+                path = self.root / self.meta.get_video_file_path(ep_idx, key)
+                frames = apply_hook(hook, frames, path, shifted, self.tolerance_s, self.video_backend)
+            item[key] = frames.squeeze(0)
         if fallback:
             item.update(super()._query_videos(fallback, ep_idx))
         return item

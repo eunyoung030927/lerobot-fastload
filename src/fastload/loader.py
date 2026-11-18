@@ -42,6 +42,7 @@ import torch
 from torch.utils.data.dataloader import DataLoader as _TorchDataLoader
 
 from fastload.dataset import CachedLeRobotDataset
+from fastload.decode_hook import active_hook, apply_hook, hook_name
 from fastload.rng import IndexDataset, TransformReplayer, WorkerRNG, collate_rows
 
 logger = logging.getLogger("fastload")
@@ -95,10 +96,14 @@ def _load_columns(dataset: CachedLeRobotDataset, names: list[str]) -> dict[str, 
     return out
 
 
+CHUNK_BYTES = int(1e9)  # GPU tier allocation unit; shrinking drops whole chunks without copying
+
+
 @dataclass
 class _GpuTier:
-    slot: np.ndarray | None = None  # [total_frames] int64, -1 = not on GPU (CPU copy only)
-    tensors: dict[str, torch.Tensor] = field(default_factory=dict)  # key -> [M, C, H, W] uint8
+    slot: np.ndarray | None = None  # [total_frames] int64 position in the tier, -1 = not on GPU
+    tensors: dict[str, list[torch.Tensor]] = field(default_factory=dict)  # key -> chunks of [F, C, H, W] uint8
+    chunk_frames: int = 1  # F: frames per chunk (position p lives in chunk p // F at row p % F)
     nbytes: int = 0
     frames: int = 0
     released: bool = False
@@ -133,6 +138,11 @@ class FastLoader:
             (per-rank episode shards); see the module docstring.
         num_workers: the ``num_workers`` of the DataLoader being reproduced (``order="lerobot"``): image
             transforms draw from the RNG streams those workers would have. No worker processes are started.
+        decode_hook_device: where a wrapper around LeRobot's ``decode_video_frames`` (e.g. a resize in the
+            data loader) runs: ``"cpu"`` = exactly as LeRobot (bit-identical; those cameras skip the GPU
+            tier), ``"gpu"`` = on the batch on the GPU (faster, float-rounding differences).
+        memory_guard: after the GPU tier exists, check free VRAM every step and drop tier chunks before the
+            model runs out of memory (the peak use of the run can grow after the tier was sized).
         placement: ``"auto"`` - grow a GPU tier after ``warmup_steps`` batches, sized from the measured
             peak memory of the run; ``"gpu"`` - put this rank's whole shard on the GPU now;
             ``"host"`` - never use VRAM for frames.
@@ -164,6 +174,8 @@ class FastLoader:
         cache_dir: str | None = None,
         order: str = "lerobot",
         num_workers: int = 0,
+        decode_hook_device: str = "cpu",
+        memory_guard: bool = True,
     ):
         if not isinstance(dataset, CachedLeRobotDataset):
             if cache_dir is None:
@@ -173,8 +185,11 @@ class FastLoader:
             raise ValueError(f"placement must be one of {PLACEMENTS}, got {placement!r}")
         if order not in ORDERS:
             raise ValueError(f"order must be one of {ORDERS}, got {order!r}")
+        if decode_hook_device not in ("cpu", "gpu"):
+            raise ValueError(f"decode_hook_device must be 'cpu' or 'gpu', got {decode_hook_device!r}")
         self.order = order
         self.num_workers = int(num_workers or 0)
+        self.memory_guard = bool(memory_guard)
         r, w, dev = _dist_info(device)
         self.rank = r if rank is None else rank
         self.world_size = w if world_size is None else world_size
@@ -233,12 +248,34 @@ class FastLoader:
         self.delta = {k: to_dev(torch.from_numpy(v)) for k, v in self.delta_np.items()}
         self._div255 = torch.tensor(255.0, dtype=torch.float32, device=self.device) if self.is_cuda else 255
 
+        # ---- decode_video_frames wrapper (e.g. a data-loader resize): same function, same place ----
+        self.decode_hook = active_hook()
+        self.hook_device = decode_hook_device
+        self.hook_keys = [k for k in self.cam_keys if k in self.video_keys] if self.decode_hook else []
+        self.out_shape = dict(self.cam_shape)  # per-frame [C, H, W] after the hook
+        for key in self.hook_keys:
+            c, h, w = self.cam_shape[key]
+            probe = self._run_hook(key, torch.zeros((1, c, h, w), dtype=torch.float32), None, [0.0])
+            if probe.dim() != 4 or probe.shape[0] != 1 or probe.dtype != torch.float32:
+                raise RuntimeError(f"fastload: decode hook returned {probe.dtype}{tuple(probe.shape)} for "
+                                   f"{key}; expected float32 [T, C, H, W]")
+            self.out_shape[key] = tuple(probe.shape[1:])
+        if self.hook_keys:
+            logger.info(f"fastload: decode_video_frames wrapper {hook_name(self.decode_hook)} applied to cached "
+                        f"frames on the {self.hook_device} "
+                        + ", ".join(f"{k} {self.cam_shape[k][1:]}->{self.out_shape[k][1:]}" for k in self.hook_keys))
+        # Frames run through the hook on the CPU never use the GPU tier (it holds raw uint8 frames).
+        self.tier_keys = [k for k in self.cam_keys if not (k in self.hook_keys and self.hook_device == "cpu")]
+        self.tier_frame_bytes = sum(self.cache.frame_nbytes(k) for k in self.tier_keys)
+        if not self.tier_keys:
+            self.placement = "host"
+
         # ---- image transforms: parameters drawn on the CPU, kernels applied on the device -------
         tf = dataset.image_transforms
         self.replayer = TransformReplayer(tf) if tf is not None else None
         self.sample_shape = {}
         for key in self.cam_keys:
-            c, h, w = self.cam_shape[key]
+            c, h, w = self.out_shape[key]
             t = len(self.delta_np[key]) if key in self.delta_np else 0
             squeeze = key in self.video_keys and t == 1
             self.sample_shape[key] = (c, h, w) if t == 0 or squeeze else (t, c, h, w)
@@ -342,12 +379,23 @@ class FastLoader:
     def gpu_cache_fraction(self) -> float:
         return self._tier.frames / max(1, len(self.local_rows))
 
+    def _margin(self, total: int) -> float:
+        return self.gpu_margin_gb * 1e9 if self.gpu_margin_gb is not None else max(2e9, 0.05 * total)
+
+    def _headroom(self) -> tuple[float, float]:
+        """(VRAM still available at the run's peak, margin): free memory minus how far the peak reservation
+        went above the current one (the model's transient need)."""
+        free, total = torch.cuda.mem_get_info(self.device)
+        peak = torch.cuda.max_memory_reserved(self.device)
+        current = torch.cuda.memory_reserved(self.device)
+        return free - max(0, peak - current), self._margin(total)
+
     def _auto_budget(self) -> int:
         torch.cuda.synchronize(self.device)
         free, total = torch.cuda.mem_get_info(self.device)
         peak = torch.cuda.max_memory_reserved(self.device)
         current = torch.cuda.memory_reserved(self.device)
-        margin = (self.gpu_margin_gb * 1e9 if self.gpu_margin_gb is not None else max(2e9, 0.05 * total))
+        margin = self._margin(total)
         budget = int(free - max(0, peak - current) - margin)
         logger.info(
             f"fastload: rank {self.rank} memory after {self._served} steps: free {free / 1e9:.1f} GB, "
@@ -357,15 +405,16 @@ class FastLoader:
         return budget
 
     def build_gpu_cache(self, budget_bytes: int | None) -> None:
-        """(Re)build the GPU tier with at most ``budget_bytes`` (None = whole local shard)."""
-        if not self.is_cuda:
+        """(Re)build the GPU tier with at most ``budget_bytes`` (None = all of this rank's frames)."""
+        if not self.is_cuda or not self.tier_keys:
             return
         self.release_gpu_cache()
-        need = len(self.local_rows) * self.frame_bytes
+        fb = self.tier_frame_bytes
+        need = len(self.local_rows) * fb
         budget = need if budget_bytes is None else min(int(budget_bytes), need)
         if self.max_gpu_cache_gb is not None:
             budget = min(budget, int(self.max_gpu_cache_gb * 1e9))
-        if budget < self.frame_bytes:
+        if budget < fb:
             logger.info(f"fastload: rank {self.rank} no VRAM left for frames; host tier only")
             return
         t0 = time.perf_counter()
@@ -374,28 +423,25 @@ class FastLoader:
         ranges, frames = [], 0
         for ep in order:
             a, b = int(self._ep_from_np[ep]), int(self._ep_to_np[ep])
-            if (frames + b - a) * self.frame_bytes > budget:
+            if (frames + b - a) * fb > budget:
                 break
             ranges.append((a, b))
             frames += b - a
         if frames == 0:
             return
+        frame_ids = np.concatenate([np.arange(a, b, dtype=np.int64) for a, b in ranges])
+        per_chunk = max(1, CHUNK_BYTES // fb)
         slot = np.full(int(self.dataset.meta.total_frames), -1, dtype=np.int64)
-        tensors = {}
+        tensors: dict[str, list[torch.Tensor]] = {k: [] for k in self.tier_keys}
         try:
-            for key in self.cam_keys:
-                c, h, w = self.cam_shape[key]
-                tensors[key] = torch.empty((frames, c, h, w), dtype=torch.uint8, device=self.device)
-            mm = {k: self.cache.array(k) for k in self.cam_keys}
-            pos = 0
-            for a, b in ranges:
-                slot[a:b] = np.arange(pos, pos + b - a)
-                for key in self.cam_keys:
-                    with warnings.catch_warnings():  # read-only memmap slice; it is only copied from
-                        warnings.simplefilter("ignore", UserWarning)
-                        src = torch.from_numpy(mm[key][a:b])
-                    tensors[key][pos:pos + b - a].copy_(src)
-                pos += b - a
+            mm = {k: self.cache.array(k) for k in self.tier_keys}
+            for start in range(0, frames, per_chunk):
+                ids = frame_ids[start:start + per_chunk]
+                for key in self.tier_keys:
+                    c, h, w = self.cam_shape[key]
+                    chunk = torch.empty((len(ids), c, h, w), dtype=torch.uint8, device=self.device)
+                    chunk.copy_(torch.from_numpy(np.asarray(mm[key][ids])))
+                    tensors[key].append(chunk)
             torch.cuda.synchronize(self.device)
         except torch.OutOfMemoryError:
             tensors.clear()
@@ -404,40 +450,95 @@ class FastLoader:
                            "retrying with half")
             self.build_gpu_cache(budget // 2)
             return
-        self._tier = _GpuTier(slot=slot, tensors=tensors, nbytes=frames * self.frame_bytes, frames=frames)
+        slot[frame_ids] = np.arange(frames)
+        self._tier = _GpuTier(slot=slot, tensors=tensors, chunk_frames=per_chunk, nbytes=frames * fb, frames=frames)
         logger.info(
-            f"fastload: rank {self.rank} GPU tier {frames * self.frame_bytes / 1e9:.1f} GB = "
-            f"{100 * self.gpu_cache_fraction:.0f}% of local frames, filled in {time.perf_counter() - t0:.1f}s"
+            f"fastload: rank {self.rank} GPU tier {frames * fb / 1e9:.1f} GB = "
+            f"{100 * self.gpu_cache_fraction:.0f}% of local frames ({len(tensors[self.tier_keys[0]])} chunks), "
+            f"filled in {time.perf_counter() - t0:.1f}s"
         )
 
-    def release_gpu_cache(self) -> None:
+    def _replace_tier(self, new: _GpuTier) -> None:
         old = self._tier
-        if old.tensors:
-            self._tier = _GpuTier()
-            old.released = True
-            old.tensors.clear()  # frees VRAM even if prepared batches still reference `old`
-            for it in list(self._iterators):
-                it._invalidate()
-            if self.is_cuda:
-                torch.cuda.empty_cache()
+        self._tier = new
+        old.released = True
+        old.tensors = {}  # drops this tier's references; chunks kept by `new` stay alive
+        for it in list(self._iterators):
+            it._invalidate()
+        if self.is_cuda:
+            torch.cuda.empty_cache()
+
+    def release_gpu_cache(self) -> None:
+        if self._tier.tensors:
+            self._replace_tier(_GpuTier())
+
+    def _truncate_tier(self, keep_bytes: float) -> None:
+        """Keep only the first chunks of the GPU tier that fit in ``keep_bytes`` (no copies)."""
+        old = self._tier
+        if not old.tensors:
+            return
+        per_chunk = old.chunk_frames
+        n_chunks = len(old.tensors[self.tier_keys[0]])
+        keep = max(0, min(n_chunks, int(keep_bytes // (per_chunk * self.tier_frame_bytes))))
+        if keep >= n_chunks:
+            keep = n_chunks - 1  # always free at least one chunk
+        if keep <= 0:
+            self.release_gpu_cache()
+            return
+        limit = keep * per_chunk
+        slot = old.slot.copy()
+        slot[slot >= limit] = -1
+        frames = min(old.frames, limit)
+        self._replace_tier(_GpuTier(slot=slot, tensors={k: v[:keep] for k, v in old.tensors.items()},
+                                    chunk_frames=per_chunk, nbytes=frames * self.tier_frame_bytes, frames=frames))
 
     def shrink_gpu_cache(self, fraction: float = 0.5) -> None:
-        """Free VRAM (e.g. after an OOM): keep ``fraction`` of the current GPU tier."""
-        keep = int(self._tier.nbytes * fraction)
-        self.release_gpu_cache()
-        if keep > 0:
-            self.build_gpu_cache(keep)
+        """Free VRAM (e.g. after an OOM): keep about ``fraction`` of the current GPU tier."""
+        before = self._tier.nbytes
+        self._truncate_tier(before * fraction)
         self._grown = True
+        logger.warning(f"fastload: rank {self.rank} GPU tier {before / 1e9:.1f} -> {self._tier.nbytes / 1e9:.1f} GB")
+
+    def _guard_memory(self) -> None:
+        """Drop tier chunks when the run's peak memory has grown into the margin left at sizing time."""
+        headroom, margin = self._headroom()
+        if headroom >= margin / 2:
+            return
+        before = self._tier.nbytes
+        self._truncate_tier(before - (margin - headroom))
+        logger.warning(
+            f"fastload: rank {self.rank} VRAM headroom {headroom / 1e9:.2f} GB < half the margin "
+            f"({margin / 1e9:.1f} GB): GPU tier {before / 1e9:.1f} -> {self._tier.nbytes / 1e9:.1f} GB"
+        )
 
     def _after_batch_served(self) -> None:
         self._served += 1
         if not self._grown and self._served >= self.warmup_steps:
             self._grown = True
             self.build_gpu_cache(self._auto_budget())
+        elif self.memory_guard and self.is_cuda and self._tier.tensors:
+            self._guard_memory()
 
     # ------------------------------------------------------------------------------------------
     # batch assembly
     # ------------------------------------------------------------------------------------------
+    def _run_hook(self, key: str, frames: torch.Tensor, row: int | None, ts: list[float]) -> torch.Tensor:
+        """Apply the decode_video_frames wrapper to one sample's frames ``[T, C, H, W]`` (float32 in [0, 1])."""
+        ds = self.dataset
+        ep_idx = int(self._episode_np[row]) if row is not None else int(self._episode_np[0])
+        path = ds.root / ds.meta.get_video_file_path(ep_idx, key)
+        return apply_hook(self.decode_hook, frames, path, list(ts), ds.tolerance_s, ds.video_backend)
+
+    def _hook_timestamps(self, key: str, q: np.ndarray, ep: np.ndarray) -> list[list[float]]:
+        """The timestamps LeRobot passes to decode_video_frames for each sample (episode-shifted)."""
+        eps = self.dataset.meta.episodes
+        ts = self.cache.timestamps[q.reshape(len(ep), -1)]
+        out = []
+        for i, e in enumerate(ep):
+            off = float(eps[int(e)][f"videos/{key}/from_timestamp"])
+            out.append([off + float(t) for t in ts[i]])
+        return out
+
     def _draw_ops(self, batch_index: int, n: int) -> list[dict[str, list]] | None:
         """Transform parameters for the ``n`` samples of a batch (cameras in LeRobot's order)."""
         if self.replayer is None:
@@ -459,8 +560,8 @@ class FastLoader:
         dev_ctx = torch.cuda.device(self.device) if self.is_cuda else _null()
         keep: list[torch.Tensor] = []
 
-        def to_dev(a: np.ndarray, pin: bool = False) -> torch.Tensor:
-            t = torch.from_numpy(np.ascontiguousarray(a))
+        def to_dev(a: np.ndarray | torch.Tensor, pin: bool = False) -> torch.Tensor:
+            t = a if isinstance(a, torch.Tensor) else torch.from_numpy(np.ascontiguousarray(a))
             if not self.is_cuda:
                 return t
             if pin:
@@ -475,19 +576,36 @@ class FastLoader:
                 if key in self.delta_np:
                     q = np.clip(abs_idx[:, None] + self.delta_np[key][None, :], frm[:, None], to[:, None] - 1)
                 else:
-                    q = abs_idx
+                    q = abs_idx[:, None]
+                t = q.shape[1]
                 flat = q.reshape(-1)
+                entry: dict[str, Any] = {"t": t, "n": flat.shape[0]}
+                if key in self.hook_keys:
+                    entry["ts"] = self._hook_timestamps(key, q, ep)
+                if key in self.hook_keys and self.hook_device == "cpu":
+                    # Exactly LeRobot's data path: uint8 -> float32 / 255 -> wrapper, per sample, on the CPU.
+                    c, h, w = self.cam_shape[key]
+                    raw = torch.from_numpy(np.ascontiguousarray(self.cache.array(key)[flat]))
+                    x = (raw.to(torch.float32) / 255).view(len(rows), t, c, h, w)
+                    y = torch.stack([self._run_hook(key, x[i], int(rows[i]), entry["ts"][i]) for i in range(len(rows))])
+                    entry["post"] = to_dev(y, pin=True)
+                    cams[key] = entry
+                    continue
                 slot = tier.slot[flat] if tier.slot is not None else np.full(flat.shape, -1, dtype=np.int64)
                 host_pos = np.nonzero(slot < 0)[0]
                 gpu_pos = np.nonzero(slot >= 0)[0]
-                entry: dict[str, Any] = {"shape": q.shape, "n": flat.shape[0]}
                 if len(host_pos):
                     data = self.cache.array(key)[flat[host_pos]]  # memmap gather -> [h, C, H, W]
                     entry["host_pos"] = to_dev(host_pos)
                     entry["host_data"] = to_dev(data, pin=True)
                 if len(gpu_pos):
-                    entry["gpu_pos"] = to_dev(gpu_pos)
-                    entry["gpu_slot"] = to_dev(slot[gpu_pos])
+                    pos_in_tier = slot[gpu_pos]
+                    chunk_of = pos_in_tier // tier.chunk_frames
+                    groups = []
+                    for cid in np.unique(chunk_of):
+                        sel = chunk_of == cid
+                        groups.append((int(cid), to_dev(gpu_pos[sel]), to_dev(pos_in_tier[sel] % tier.chunk_frames)))
+                    entry["gpu"] = groups
                 cams[key] = entry
             event = None
             if self.is_cuda:
@@ -503,19 +621,23 @@ class FastLoader:
         cur = torch.cuda.current_stream(self.device)
         cur.wait_event(prep.event)
         for entry in prep.cams.values():
-            for name in ("host_pos", "host_data", "gpu_pos", "gpu_slot"):
+            for name in ("host_pos", "host_data", "post"):
                 if name in entry:
                     entry[name].record_stream(cur)
+            for _, pos, off in entry.get("gpu", ()):
+                pos.record_stream(cur)
+                off.record_stream(cur)
         prep.rows_dev.record_stream(cur)
 
     def _finalize(self, prep: _Prepared, ops: list[dict[str, list]] | None = None) -> dict[str, Any]:
         """GPU-side gathers on the training stream; returns the collated batch."""
-        if prep.tier.released:  # its GPU tier was freed (shrink after OOM): rebuild from the host tier
+        if prep.tier.released:  # its GPU tier was freed or shrunk: rebuild the batch from the host tier
             prep = self._prepare(prep.rows, prep.batch_index)
         self._sync(prep)
         tier = prep.tier
 
         rows = prep.rows_dev
+        n_b = len(prep.rows)
         batch: dict[str, Any] = {}
         abs_idx = self.columns["index"][rows]
         ep = self.columns["episode_index"][rows]
@@ -535,21 +657,29 @@ class FastLoader:
             raise RuntimeError("fastload: image transforms are enabled but no parameters were drawn for this batch")
         for key in self.cam_keys:
             entry = prep.cams[key]
-            c, h, w = self.cam_shape[key]
-            out = torch.empty((entry["n"], c, h, w), dtype=torch.uint8, device=self.device)
-            if "host_pos" in entry:
-                out.index_copy_(0, entry["host_pos"], entry["host_data"])
-            if "gpu_pos" in entry:
-                out.index_copy_(0, entry["gpu_pos"], tier.tensors[key].index_select(0, entry["gpu_slot"]))
-            # LeRobot's decoders compute float32(x) / 255 on CPU. On CUDA, dividing by a Python scalar is
-            # turned into x * (1/255) (1-ulp differences); a 0-dim CUDA tensor keeps a true division.
-            img = out.to(torch.float32) / self._div255
-            img = img.view(*entry["shape"], c, h, w)
+            t = entry["t"]
+            if "post" in entry:
+                img = entry["post"]  # [B, T, C, H, W] float32, already through the decode hook on the CPU
+            else:
+                c, h, w = self.cam_shape[key]
+                out = torch.empty((entry["n"], c, h, w), dtype=torch.uint8, device=self.device)
+                if "host_pos" in entry:
+                    out.index_copy_(0, entry["host_pos"], entry["host_data"])
+                for cid, pos, off in entry.get("gpu", ()):
+                    out.index_copy_(0, pos, tier.tensors[key][cid].index_select(0, off))
+                # LeRobot's decoders compute float32(x) / 255 on CPU. On CUDA, dividing by a Python scalar is
+                # turned into x * (1/255) (1-ulp differences); a 0-dim CUDA tensor keeps a true division.
+                img = (out.to(torch.float32) / self._div255).view(n_b, t, c, h, w)
+                if key in self.hook_keys:  # decode hook on the device
+                    img = torch.stack([self._run_hook(key, img[i], int(prep.rows[i]), entry["ts"][i])
+                                       for i in range(n_b)])
             if key in self.delta:
                 q = abs_idx[:, None] + self.delta[key][None, :]
                 batch[f"{key}_is_pad"] = (q < frm[:, None]) | (q >= to[:, None])
-                if key in self.video_keys and img.shape[1] == 1:
-                    img = img.squeeze(1)  # LeRobot squeezes single-timestamp video queries
+                if key in self.video_keys and t == 1:
+                    img = img[:, 0]  # LeRobot squeezes single-timestamp video queries
+            else:
+                img = img[:, 0]
             if ops is not None:  # per sample, with the parameters LeRobot's worker would have drawn
                 img = torch.stack([TransformReplayer.apply(x, ops[i][key]) for i, x in enumerate(img)])
             batch[key] = img

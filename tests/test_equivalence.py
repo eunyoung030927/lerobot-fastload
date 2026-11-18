@@ -92,13 +92,23 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
         return CachedLeRobotDataset.from_dataset(ds, cache_dir) if cached else ds
 
     def check_loader(ref, cached, rows, tag):
+        import fastload.loader as fl_loader
+
         loader = FastLoader(cached, batch, shuffle=False, placement="host", device=device, rank=0, world_size=1)
         tiers = [("host", None)]
         if loader.is_cuda:
-            shard = len(loader.local_rows) * loader.frame_bytes
-            tiers += [("gpu-partial", shard // 2), ("gpu-full", None)]
+            shard = len(loader.local_rows) * loader.tier_frame_bytes
+            # small chunks so the tier has several of them (gathers across chunks, shrinking drops chunks)
+            fl_loader.CHUNK_BYTES = max(loader.tier_frame_bytes, shard // 7)
+            tiers += [("gpu-partial", shard // 2), ("gpu-full", None), ("gpu-after-memory-guard", "guard")]
         for tier_name, budget in tiers:
-            if tier_name != "host":
+            if budget == "guard":  # memory guard: pretend the peak grew into the margin -> drop about half the chunks
+                loader.build_gpu_cache(None)
+                half = loader._tier.nbytes / 2
+                loader._headroom = lambda: (0.0, half)
+                loader._guard_memory()
+                del loader._headroom
+            elif tier_name != "host":
                 loader.build_gpu_cache(budget)
             for s in range(0, len(rows), batch):
                 chunk = rows[s:s + batch]

@@ -21,6 +21,7 @@ test = ["pytest"]
 [project.scripts]
 fastload-build-cache = "fastload.build_cache:main"
 fastload-train = "fastload.train:main"
+fastload-supervise = "fastload.supervise:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

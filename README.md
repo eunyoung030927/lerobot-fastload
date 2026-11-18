@@ -76,7 +76,9 @@ accelerate launch --num_processes 8 -m fastload.train \
 | `--fastload.gpu_margin_gb` | max(2 GB, 5%) | VRAM kept free above the measured peak |
 | `--fastload.max_gpu_cache_gb` | none | cap on the VRAM tier |
 | `--fastload.prefetch` | 2 | batches prepared ahead |
-| `--fastload.oom_retry` | true | single process only: on CUDA OOM halve the VRAM tier and retry the step |
+| `--fastload.memory_guard` | true | every step, drop VRAM-tier chunks if the run's peak memory grew into the margin |
+| `--fastload.oom_retry` | true | CUDA OOM in a step: one process -> halve the VRAM tier and retry; several -> stop all ranks at once and leave a note for `fastload.supervise` |
+| `--fastload.decode_hook_device` | `cpu` | where a wrapper around LeRobot's `decode_video_frames` (e.g. a data-loader resize) runs: `cpu` = bit-identical to LeRobot, `gpu` = faster, float rounding |
 
 With `loader=fast` no worker processes are started: `num_workers` only selects the emulated worker RNG
 streams for image augmentation, and `pin_memory` / `prefetch_factor` are ignored.
@@ -130,6 +132,39 @@ shuffled within the shard every epoch. Every optimizer step still averages gradi
 all shards, but the batches differ from LeRobot's. Use it when VRAM hit rate on many GPUs matters more
 than reproducing LeRobot.
 
+## Running out of GPU memory
+
+The VRAM tier is sized from the peak memory measured during the first `warmup_steps`. Later steps can
+need more (longer sequences, evaluation, checkpointing), so:
+
+1. **Memory guard** (every step, any number of GPUs): if free VRAM minus the run's peak transient need drops
+   below half of `gpu_margin_gb`, whole tier chunks (1 GB each) are dropped until the margin is back. No
+   copies; dropped frames are read from RAM / disk again. Batches are unchanged.
+2. **OOM in a step, one process**: halve the tier and retry the step.
+3. **OOM in a step, several processes**: the other ranks already wait in the gradient all-reduce, so one rank
+   cannot redo the step alone. All ranks stop at once (instead of hanging until the NCCL timeout) and leave
+   a note. Run training under the supervisor to restart automatically from the last checkpoint (LeRobot's
+   own `--resume`, including RNG state) with half the tier:
+
+```bash
+python -m fastload.supervise --max_restarts 3 -- \
+    accelerate launch --num_processes 8 -m fastload.train <lerobot-train args> --fastload.cache_dir=...
+```
+
+If there is no checkpoint yet, the run starts over with the smaller tier and the failed output directory
+is renamed to `<output_dir>.oom<N>`.
+
+## Data-loader code that wraps LeRobot's video decoder
+
+Training scripts sometimes change frames right after decoding by wrapping
+`lerobot.datasets.lerobot_dataset.decode_video_frames` (e.g. resizing 480x640 to 240x320 in the DataLoader
+workers). fastload never decodes video, so it calls that wrapper itself with LeRobot's backend decoder
+answering with the cached frames: the wrapper's own code runs on exactly the frames LeRobot's decoder would
+return, at the same point (before `image_transforms`). With `--fastload.decode_hook_device=cpu` (default)
+the result is bit-identical to LeRobot; those cameras then skip the VRAM tier. `gpu` runs the wrapper on
+the batch on the GPU instead. Build the cache in a process without the wrapper (`build_cache` refuses
+otherwise).
+
 ## Limitations
 
 * Single `LeRobotDataset` (as `lerobot-train`); `StreamingLeRobotDataset` is not supported.
@@ -138,7 +173,6 @@ than reproducing LeRobot.
 * `order=lerobot` follows `persistent_workers=False` (LeRobot's setting) and a `cycle()` that finishes each
   epoch before starting the next.
 * GPU kernels themselves are not deterministic by default (`cudnn.benchmark`, atomics), in LeRobot too.
-* OOM recovery is single-process only; under DDP keep `gpu_margin_gb` conservative.
 * The cache uses `index` = absolute frame number, which holds for datasets written by LeRobot.
 
 ## License

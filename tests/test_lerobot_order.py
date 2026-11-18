@@ -26,23 +26,25 @@ import numpy as np
 import torch
 
 
-def make_synthetic(root: Path, episodes: int = 6, fps: int = 10) -> str:
+def make_synthetic(root: Path, episodes: int = 6, fps: int = 10, videos: bool = False) -> str:
+    """Tiny LeRobot dataset with two cameras (PNG images, or mp4 videos with ``videos=True``)."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     repo_id = "fastload/synthetic"
+    dtype = "video" if videos else "image"
+    shapes = {"observation.image": (64, 96, 3), "observation.wrist": (64, 64, 3)} if videos else \
+        {"observation.image": (24, 32, 3), "observation.wrist": (16, 16, 3)}
     features = {
-        "observation.image": {"dtype": "image", "shape": (24, 32, 3), "names": ["height", "width", "channel"]},
-        "observation.wrist": {"dtype": "image", "shape": (16, 16, 3), "names": ["height", "width", "channel"]},
+        **{k: {"dtype": dtype, "shape": s, "names": ["height", "width", "channel"]} for k, s in shapes.items()},
         "observation.state": {"dtype": "float32", "shape": (3,), "names": None},
         "action": {"dtype": "float32", "shape": (2,), "names": None},
     }
-    ds = LeRobotDataset.create(repo_id, fps=fps, features=features, root=root, use_videos=False)
+    ds = LeRobotDataset.create(repo_id, fps=fps, features=features, root=root, use_videos=videos)
     rng = np.random.default_rng(0)
     for ep in range(episodes):
         for _ in range(int(rng.integers(15, 30))):
             ds.add_frame({
-                "observation.image": rng.integers(0, 256, (24, 32, 3), dtype=np.uint8),
-                "observation.wrist": rng.integers(0, 256, (16, 16, 3), dtype=np.uint8),
+                **{k: rng.integers(0, 256, s, dtype=np.uint8) for k, s in shapes.items()},
                 "observation.state": rng.normal(size=3).astype(np.float32),
                 "action": rng.normal(size=2).astype(np.float32),
                 "task": f"task {ep % 2}",
@@ -92,7 +94,7 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg):
     else:
         ds = CachedLeRobotDataset.from_dataset(ds, args.cache_dir)
         dl = FastLoader(ds, order="lerobot", num_workers=num_workers, placement=args.placement,
-                        device=accelerator.device, **common)
+                        device=accelerator.device, decode_hook_device=args.hook_device, **common)
     dl = accelerator.prepare(dl)
 
     batches, states = [], []
@@ -151,20 +153,39 @@ def main() -> int:
     p.add_argument("--workers", default="0,2")
     p.add_argument("--atol", type=float, default=1e-5)
     p.add_argument("--episodes", type=int, default=0, help="use only the first N episodes (0 = all)")
+    p.add_argument("--video", action="store_true", help="synthetic dataset with mp4 videos instead of images")
+    p.add_argument("--decode_hook", choices=["none", "resize"], default="none",
+                   help="wrap LeRobot's decode_video_frames with a half-size bilinear antialiased resize "
+                        "(like a data-loader resize in a training script)")
+    p.add_argument("--hook_device", choices=["cpu", "gpu"], default="cpu")
     args = p.parse_args()
+
+    import subprocess
 
     from accelerate import Accelerator
     from lerobot.datasets.transforms import ImageTransformsConfig
-
-    from fastload.build_cache import build_cache
 
     tmp = None
     if args.repo_id is None:
         tmp = tempfile.TemporaryDirectory()
         args.root = str(Path(tmp.name) / "ds")
-        args.repo_id = make_synthetic(Path(args.root))
+        args.repo_id = make_synthetic(Path(args.root), videos=args.video)
         args.cache_dir = str(Path(tmp.name) / "cache")
-        build_cache(args.repo_id, args.cache_dir, root=args.root, num_workers=1, verify=8)
+        # In a separate process: decoding videos here would leave open decoders that DataLoader workers
+        # inherit (LeRobot's global decoder cache), which breaks LeRobot's own worker decoding.
+        subprocess.check_call([sys.executable, "-m", "fastload.build_cache", "--repo_id", args.repo_id, "--root",
+                               args.root, "--cache_dir", args.cache_dir, "--num_workers", "1", "--verify", "8"])
+    if args.decode_hook == "resize":
+        import torch.nn.functional as F
+        import lerobot.datasets.lerobot_dataset as lds
+
+        decode = lds.decode_video_frames
+
+        def decode_resized(*a, **k):
+            x = decode(*a, **k)
+            return F.interpolate(x, size=(x.shape[-2] // 2, x.shape[-1] // 2), mode="bilinear", antialias=True)
+
+        lds.decode_video_frames = decode_resized
 
     accelerator = Accelerator(cpu=args.device == "cpu")
     tf_on = ImageTransformsConfig(enable=True, max_num_transforms=3)
