@@ -103,6 +103,14 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg):
                                       episode_indices_to_use=ds.episodes, drop_n_last_frames=2, shuffle=True)
     common = dict(batch_size=args.batch, shuffle=sampler is None, sampler=sampler, drop_last=False)
     if kind == "lerobot":
+        if num_workers > 0:
+            # lerobot_train never decodes in the main process before its workers fork. This test does (earlier
+            # num_workers=0 cases, the cache check), and forked workers would inherit LeRobot's module-level open
+            # decoders ("Could not push packet to decoder: Invalid data"). Start them clean, as lerobot_train does.
+            from lerobot.datasets import video_utils
+
+            if hasattr(video_utils, "_default_decoder_cache"):
+                video_utils._default_decoder_cache.clear()
         dl = torch.utils.data.DataLoader(ds, num_workers=num_workers, pin_memory=False,
                                          prefetch_factor=2 if num_workers > 0 else None, **common)
     else:
