@@ -194,7 +194,11 @@ def test_build_first(data: Data, work: Path) -> list[str]:
 
     cache = work / f"build_first_{data.variant}"
     out = work / f"out_build_first_{data.variant}"
+    # build with the reference cache's decoder: LeRobot's default backend can depend on the process (e.g. torchcodec
+    # loads in a bare build_cache process but not after lerobot_train's imports), and compare_caches checks it
+    ref_backend = json.loads((data.cache / "fastload_meta.json").read_text()).get("video_backend")
     p = _run([sys.executable, "-m", "fastload.train", *_act_args(data, out, 6),
+              *([f"--dataset.video_backend={ref_backend}"] if ref_backend else []),
               f"--fastload.cache_dir={cache}", "--fastload.cache_mode=build_first"],
              log=work / f"build_first_{data.variant}.log")
     text = p.stdout + p.stderr
