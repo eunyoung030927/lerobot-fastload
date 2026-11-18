@@ -27,6 +27,12 @@ Batch order (``order``):
 * ``"shard"`` - each rank owns whole episodes and shuffles within them (fastest multi-GPU; the GPU
   tier holds this rank's own episodes). Transform parameters use a private RNG stream. Not with context /
   tensor parallelism (ranks of one data-parallel group would need the same batches).
+
+Incomplete cache (``cache_mode="during_training"``): a :class:`fastload.fill.CacheFiller` (decoder processes) fills
+it. The prefetch thread asks it for the frames of the next batches (cache misses only, observation history
+included) and waits, before reading a batch, until that batch's frames are filled. Nothing else changes: batches,
+order and RNG draws are those of a complete cache, since decoding happens in other processes and the frames are
+stored before they are read. The GPU tier waits until the cache is complete.
 """
 
 from __future__ import annotations
@@ -48,6 +54,7 @@ from torch.utils.data.dataloader import DataLoader as _TorchDataLoader
 
 from fastload import _lr
 from fastload.dataset import CachedLeRobotDataset
+from fastload.cache import DEFAULT_MIN_FREE_DISK_GB
 from fastload.decode_hook import active_hook, apply_hook, hook_name
 from fastload.rng import IndexDataset, WorkerRNG, collate_rows, make_replayer
 
@@ -192,8 +199,18 @@ class FastLoader:
             optimizer step so optimizer state is counted.
         gpu_margin_gb: VRAM left free on top of the measured peak (default: max(2 GB, 5% of the GPU)).
         max_gpu_cache_gb: upper bound on the GPU tier size.
-        prefetch: batches prepared ahead by the background thread.
+        prefetch: batches prepared ahead by the background thread (at least 4 while the cache is being filled).
         seed: shuffling seed (default: derived from torch's initial seed). Shards are seed-independent.
+        cache_mode: when ``dataset`` is not a CachedLeRobotDataset yet: ``"prebuilt"`` (the cache in ``cache_dir``
+            must be complete), ``"build_first"`` (build it now) or ``"during_training"`` (fill it while serving
+            batches); see :meth:`CachedLeRobotDataset.from_dataset`. Whenever the dataset's cache is incomplete, the
+            loader fills it.
+        decode_workers: decoder processes that fill an incomplete cache (default: about half the CPU cores divided
+            by the processes on this node).
+        background_fill: while decoders are idle, also decode frames no batch has asked for yet, so the cache
+            completes (and becomes a regular prebuilt cache) even if training never reads some frames.
+        min_free_disk_gb: free disk that must remain after the cache is written (``cache_mode`` other than
+            prebuilt); a safety margin, not a size limit.
     """
 
     def __init__(
@@ -222,11 +239,17 @@ class FastLoader:
         persistent_workers: bool = False,
         collate_fn: Any = None,
         generator: torch.Generator | None = None,
+        cache_mode: str = "prebuilt",
+        decode_workers: int | None = None,
+        background_fill: bool = True,
+        min_free_disk_gb: float | None = DEFAULT_MIN_FREE_DISK_GB,
     ):
         if not isinstance(dataset, CachedLeRobotDataset):
             if cache_dir is None:
                 raise ValueError("dataset is not a CachedLeRobotDataset; pass cache_dir=...")
-            dataset = CachedLeRobotDataset.from_dataset(dataset, cache_dir)
+            dataset = CachedLeRobotDataset.from_dataset(dataset, cache_dir, cache_mode=cache_mode,
+                                                        min_free_disk_gb=min_free_disk_gb,
+                                                        build_workers=decode_workers)
         if placement not in PLACEMENTS:
             raise ValueError(f"placement must be one of {PLACEMENTS}, got {placement!r}")
         if order not in ORDERS:
@@ -392,9 +415,18 @@ class FastLoader:
             raise RuntimeError(f"rank {self.rank}: no frames ({len(base_rows)} frames for {self.world_size} ranks)")
 
         self._tier = _GpuTier()
+        self._tier_deferred: tuple[str, int | None] | None = None  # GPU tier waiting for the cache to complete
         self._served = 0
         self._epoch = 0
         self._grown = self.placement != "auto"
+        # ---- an incomplete cache (cache_mode="during_training"): decoder processes fill it -------------------
+        self._filler = None
+        self._fill_lookahead = max(8, 2 * self.prefetch)  # batches whose frames are requested ahead
+        if not self.cache.complete:
+            from fastload.fill import CacheFiller, default_decode_workers
+
+            self._filler = CacheFiller(self.cache, _lr.dataset_source(dataset), self._ep_from_np, self._ep_to_np,
+                                       decode_workers or default_decode_workers(), background=background_fill)
         self._copy_stream = torch.cuda.Stream(device=self.device) if self.is_cuda else None
         self._iterators: "weakref.WeakSet[_EpochIterator]" = weakref.WeakSet()
         _ACTIVE_LOADERS.add(self)
@@ -494,6 +526,12 @@ class FastLoader:
     def build_gpu_cache(self, budget_bytes: int | None) -> None:
         """(Re)build the GPU tier with at most ``budget_bytes`` (None = all of this rank's frames)."""
         if not self.is_cuda or not self.tier_keys:
+            return
+        if self._filling:
+            # Frames that are not decoded yet must not be copied to VRAM: build the tier once the cache is complete.
+            if self._tier_deferred is None:
+                logger.info(f"fastload: rank {self.rank} GPU tier deferred until the cache is complete")
+            self._tier_deferred = ("budget", budget_bytes)
             return
         self.release_gpu_cache()
         fb = self.tier_frame_bytes
@@ -600,11 +638,51 @@ class FastLoader:
 
     def _after_batch_served(self) -> None:
         self._served += 1
-        if not self._grown and self._served >= self.warmup_steps:
+        if self._tier_deferred is not None and not self._filling:
+            kind, budget = self._tier_deferred
+            self._tier_deferred = None
+            self.build_gpu_cache(self._auto_budget() if kind == "auto" else budget)
+        elif not self._grown and self._served >= self.warmup_steps:
             self._grown = True
-            self.build_gpu_cache(self._auto_budget())
+            if self._filling and self.is_cuda and self.tier_keys:
+                logger.info(f"fastload: rank {self.rank} GPU tier deferred until the cache is complete")
+                self._tier_deferred = ("auto", None)  # sized from the memory measured then
+            else:
+                self.build_gpu_cache(self._auto_budget())
         elif self.memory_guard and self.is_cuda and self._tier.tensors:
             self._guard_memory()
+
+    # ------------------------------------------------------------------------------------------
+    # incomplete cache (cache_mode="during_training")
+    # ------------------------------------------------------------------------------------------
+    @property
+    def _filling(self) -> bool:
+        return self._filler is not None and not self._filler.complete
+
+    @property
+    def cache_complete(self) -> bool:
+        return self._filler is None or self._filler.complete
+
+    @property
+    def fill_stats(self) -> dict[str, Any] | None:
+        """Counters of the cache filler (tasks, frames decoded, time waited for frames), None without one."""
+        return dict(self._filler.stats, complete=self._filler.complete) if self._filler is not None else None
+
+    def finish_cache(self, timeout: float | None = None) -> bool:
+        """Decode every frame the cache still lacks and wait (``timeout`` seconds at most). Returns whether the
+        cache is complete. Training does not need this: the filler completes the cache in the background."""
+        return self._filler.finish(timeout) if self._filler is not None else True
+
+    def _needed_frames(self, rows: np.ndarray) -> np.ndarray:
+        """Absolute frame indices of every camera frame of the samples ``rows`` (observation history included)."""
+        abs_idx = self._index_np[rows]
+        ep = self._episode_np[rows]
+        frm, to = self._ep_from_np[ep], self._ep_to_np[ep]
+        parts = [abs_idx]
+        for d in {tuple(self.delta_np[k].tolist()) for k in self.cam_keys if k in self.delta_np}:
+            q = np.clip(abs_idx[:, None] + np.asarray(d, dtype=np.int64)[None, :], frm[:, None], to[:, None] - 1)
+            parts.append(q.reshape(-1))
+        return np.concatenate(parts)
 
     # ------------------------------------------------------------------------------------------
     # batch assembly
@@ -670,6 +748,8 @@ class FastLoader:
 
     def _prepare(self, rows: np.ndarray, batch_index: int = -1, ops: list | None = None) -> _Prepared:
         """CPU work + host->GPU copies for one batch (runs in the background thread)."""
+        if self._filling:  # wait until every frame this batch reads is decoded and stored
+            self._filler.ensure(self._needed_frames(rows))
         tier = self._tier
         abs_idx = self._index_np[rows]
         ep = self._episode_np[rows]
@@ -843,6 +923,8 @@ class FastLoader:
 
     def close(self) -> None:
         """Stop prefetch threads and free the GPU tier. Called automatically at interpreter exit."""
+        if self._filler is not None:  # first: a prefetch thread waiting for frames stops waiting
+            self._filler.close()
         for it in list(self._iterators):
             it.close()
         self.release_gpu_cache()
@@ -900,7 +982,12 @@ class _EpochIterator:
         if loader.cpu_augment and (rng.private_seed is not None or rng.num_workers > 0):
             self._pre_ops = {}
             self._draw_ahead(0)
-        self._queue: queue.Queue = queue.Queue(maxsize=loader.prefetch)
+        # While the cache is being filled, frames of the next batches are requested ahead (decoded in parallel by
+        # the filler's processes) and a few more prepared batches absorb decoding jitter.
+        self._fill = loader._filler if loader._filling else None
+        self._requested = 0
+        self._queue: queue.Queue = queue.Queue(maxsize=loader.prefetch if self._fill is None
+                                               else max(loader.prefetch, 4))
         self._pending: list[tuple[int, np.ndarray]] = []
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._produce, daemon=True, name="fastload-prefetch")
@@ -942,6 +1029,11 @@ class _EpochIterator:
     def _produce(self) -> None:
         try:
             for i, rows in enumerate(self.batches):
+                if self._fill is not None and not self._fill.complete:
+                    ahead = min(len(self.batches), i + self.loader._fill_lookahead)
+                    while self._requested < ahead:
+                        self._fill.request(self.loader._needed_frames(self.batches[self._requested]))
+                        self._requested += 1
                 pre = self._take_pre_ops(i)
                 if self._stop.is_set() or not self._put(self.loader._prepare(rows, i, pre)):
                     return

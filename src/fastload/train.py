@@ -6,6 +6,13 @@ Usage: the normal lerobot-train arguments plus ``--fastload.*`` options::
         --dataset.repo_id=<repo> --dataset.root=<dir> --policy.type=pi05 --batch_size=32 --steps=30000 \
         --fastload.cache_dir=/nvme/fastload/<repo>
 
+The cache (``--fastload.cache_mode``): ``prebuilt`` (default) needs a complete cache from ``fastload.build_cache``;
+``build_first`` builds a missing / incomplete one before ``lerobot_train.train()`` starts (before the Accelerator and
+the process group exist, so no collective can time out; only ``LOCAL_RANK`` 0 of each node builds, the other local
+ranks wait for it); ``during_training`` allocates it there and FastLoader fills it while the first epoch runs (see
+:mod:`fastload.fill`). The dataset to decode comes from the ``--dataset.*`` arguments (or the ``train_config.json`` of
+``--config_path`` when resuming).
+
 This runs LeRobot's own ``lerobot.scripts.lerobot_train.train`` unchanged except for three hooks:
 
 1. ``make_train_eval_datasets`` returns the training dataset as a :class:`CachedLeRobotDataset` (frames from the
@@ -43,6 +50,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from fastload import _lr
+from fastload.cache import CACHE_MODES, DEFAULT_MIN_FREE_DISK_GB, DiskSpaceError, cache_status, missing_cache_message
 from fastload.dataset import CachedLeRobotDataset
 from fastload.loader import ORDERS, PLACEMENTS, FastLoader, active_loaders
 
@@ -54,6 +63,17 @@ PREFIX = "--fastload."
 @dataclass
 class FastLoadConfig:
     cache_dir: str | None = None
+    # "prebuilt" = a complete cache from `python -m fastload.build_cache` is required; "build_first" = build a
+    # missing / incomplete cache before training starts; "during_training" = the first epoch decodes the frames it
+    # needs into the cache (in decoder processes), later epochs read it.
+    cache_mode: str = "prebuilt"
+    # Decoder processes that build (build_first) or fill (during_training) the cache. Default: build_first -> half
+    # the CPU cores; during_training -> half the CPU cores divided by the training processes on the node.
+    decode_workers: int | None = None
+    # during_training: while decoders are idle, decode frames no batch asked for yet, so the cache completes.
+    background_fill: bool = True
+    # Refuse to write the cache unless this much disk stays free afterwards (GB; a safety margin, -1 = no check).
+    min_free_disk_gb: float = DEFAULT_MIN_FREE_DISK_GB
     # "fast" = FastLoader (GPU tier + prefetch thread); "dataloader" = LeRobot's DataLoader over the cache.
     loader: str = "fast"
     # "lerobot" = same batches, order and data RNG draws as LeRobot's DataLoader (needs the same --num_workers);
@@ -81,6 +101,12 @@ class FastLoadConfig:
             raise SystemExit("fastload: --fastload.cache_dir=<dir> is required (build it with fastload.build_cache)")
         if self.loader not in ("fast", "dataloader"):
             raise SystemExit(f"fastload: --fastload.loader must be fast|dataloader, got {self.loader}")
+        if self.cache_mode not in CACHE_MODES:
+            raise SystemExit(f"fastload: --fastload.cache_mode must be one of {'|'.join(CACHE_MODES)}, "
+                             f"got {self.cache_mode}")
+        if self.cache_mode == "during_training" and self.loader != "fast":
+            raise SystemExit("fastload: --fastload.cache_mode=during_training needs --fastload.loader=fast (FastLoader "
+                             "fills the cache); use build_first with --fastload.loader=dataloader")
         if self.order not in ORDERS:
             raise SystemExit(f"fastload: --fastload.order must be one of {ORDERS}, got {self.order}")
         if self.augment_device not in ("cpu", "gpu"):
@@ -264,7 +290,10 @@ def install_hooks(fl: FastLoadConfig):
             raise SystemExit("fastload: --dataset.streaming=true is not supported (StreamingLeRobotDataset decodes "
                              "on the fly); train from the local dataset and its fastload cache instead")
         train_ds, eval_ds = orig_make_datasets(cfg)
-        train_ds = CachedLeRobotDataset.from_dataset(train_ds, fl.cache_dir)  # eval dataset: LeRobot's decoding
+        # eval dataset: LeRobot's decoding. build_first / during_training already prepared the cache in main().
+        train_ds = CachedLeRobotDataset.from_dataset(train_ds, fl.cache_dir, cache_mode=fl.cache_mode,
+                                                     min_free_disk_gb=fl.min_free_disk_gb,
+                                                     build_workers=fl.decode_workers)
         logger.info(f"fastload: frames from cache {fl.cache_dir} (loader={fl.loader})")
         return train_ds, eval_ds
 
@@ -301,6 +330,8 @@ def install_hooks(fl: FastLoadConfig):
                     persistent_workers=persistent,
                     collate_fn=kwargs.get("collate_fn"),
                     generator=kwargs.get("generator"),
+                    decode_workers=fl.decode_workers,
+                    background_fill=fl.background_fill,
                 )
             return orig_dataloader(dataset, *args, **kwargs)
 
@@ -353,10 +384,39 @@ def install_hooks(fl: FastLoadConfig):
     return undo, state
 
 
+def prepare_cache(fl: FastLoadConfig, train_args: list[str]) -> None:
+    """Before ``lerobot_train.train()``: check (prebuilt), build (build_first) or allocate (during_training) the cache.
+
+    Runs before the Accelerator / process group exists, so a long build cannot hit a collective timeout. With several
+    processes per node only ``LOCAL_RANK`` 0 builds; the others wait (:func:`fastload.fill.ensure_cache`).
+    """
+    from fastload.fill import ensure_cache
+
+    status = cache_status(fl.cache_dir)
+    if fl.cache_mode == "prebuilt":
+        if status != "complete":
+            try:
+                src = _lr.dataset_source_from_cli(train_args)
+            except SystemExit:
+                src = {}
+            raise SystemExit("fastload: " + missing_cache_message(fl.cache_dir, src.get("repo_id"), src.get("root"),
+                                                                  partial=status == "partial"))
+        return
+    # lerobot_train configures logging only inside train() (and replaces these handlers then)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(asctime)s %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S", force=True)
+    try:
+        ensure_cache(fl.cache_mode, fl.cache_dir, lambda: _lr.dataset_source_from_cli(train_args),
+                     fl.min_free_disk_gb, num_workers=fl.decode_workers)
+    except DiskSpaceError as e:
+        raise SystemExit(str(e)) from None
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     fl, rest = split_args(argv)
     fl.validate()
+    prepare_cache(fl, rest)
     sys.argv = [sys.argv[0], *rest]  # lerobot's parser reads sys.argv
 
     import lerobot.scripts.lerobot_train as lt
