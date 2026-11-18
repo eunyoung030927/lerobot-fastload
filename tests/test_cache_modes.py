@@ -378,7 +378,7 @@ def main() -> int:
         raise SystemExit(f"unknown tests {sorted(unknown)}; known: {ALL_TESTS}")
     tmp = None
     if args.work_dir:
-        work = Path(args.work_dir)
+        work = Path(args.work_dir).resolve()  # subprocesses run with cwd=REPO
         if work.exists():
             shutil.rmtree(work)
         work.mkdir(parents=True)
