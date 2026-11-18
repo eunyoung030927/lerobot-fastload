@@ -16,7 +16,7 @@ from lerobot.datasets.dataset_reader import DatasetReader  # noqa: E402
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 
 from fastload import _lr  # noqa: E402
-from fastload.cache import FrameCache  # noqa: E402
+from fastload.cache import DEFAULT_MIN_FREE_DISK_GB, FrameCache  # noqa: E402
 from fastload.decode_hook import active_hook, apply_hook  # noqa: E402
 
 
@@ -48,6 +48,12 @@ class CachedDatasetReader(DatasetReader):
                 item[key] = None  # type: ignore[assignment]  # keeps LeRobot's key order
                 continue
             rel = _nearest(ep_ts, np.asarray(query_ts, dtype=np.float64), self._tolerance_s, key, ep_idx)
+            filled = cache.filled()  # None once the cache is complete
+            if filled is not None and not bool(np.all(filled[start + rel])):
+                # cache_mode="during_training" and these frames are not stored yet: LeRobot's own decoding
+                fallback[key] = query_ts
+                item[key] = None  # type: ignore[assignment]
+                continue
             raw = torch.from_numpy(np.asarray(cache.array(key)[start + rel]))  # [T, C, H, W] uint8 copy
             hook = active_hook()
             if hook is not None:  # a wrapper around decode_video_frames (e.g. a resize) runs as with LeRobot
@@ -75,8 +81,16 @@ class CachedLeRobotDataset(LeRobotDataset):
     fastload_cache: FrameCache
 
     @classmethod
-    def from_dataset(cls, dataset: LeRobotDataset, cache_dir: str | Path) -> "CachedLeRobotDataset":
-        """Convert an existing LeRobotDataset in place (keeps all of its configuration)."""
+    def from_dataset(cls, dataset: LeRobotDataset, cache_dir: str | Path, cache_mode: str = "prebuilt",
+                     min_free_disk_gb: float | None = DEFAULT_MIN_FREE_DISK_GB,
+                     build_workers: int | None = None) -> "CachedLeRobotDataset":
+        """Convert an existing LeRobotDataset in place (keeps all of its configuration).
+
+        ``cache_mode``: ``"prebuilt"`` (the cache must be complete), ``"build_first"`` (build a missing / incomplete
+        cache now, with ``build_workers`` decoder processes) or ``"during_training"`` (allocate it now; a
+        :class:`fastload.FastLoader` fills it while it serves batches; frames not filled yet are decoded by LeRobot
+        when the dataset is indexed directly). See :func:`fastload.fill.ensure_cache` for several processes per node.
+        """
         if isinstance(dataset, cls):
             return dataset
         if type(dataset) is not LeRobotDataset:
@@ -84,7 +98,13 @@ class CachedLeRobotDataset(LeRobotDataset):
         rd = _lr.reader(dataset)
         if type(rd) is not DatasetReader:
             raise TypeError(f"Only LeRobot's DatasetReader is supported, got {type(rd).__name__}.")
-        cache = FrameCache(cache_dir)
+        if cache_mode != "prebuilt":
+            from fastload.fill import ensure_cache
+
+            ensure_cache(cache_mode, cache_dir, lambda: _lr.dataset_source(dataset), min_free_disk_gb,
+                         num_workers=build_workers)
+        cache = FrameCache(cache_dir, allow_incomplete=cache_mode == "during_training", repo_id=dataset.repo_id,
+                           root=dataset.root)
         # Depth cameras are not cached (12-bit / float frames): the reader decodes them with LeRobot's code.
         depth = set(_lr.depth_keys(dataset.meta))
         cache.check_compatible(dataset, keys=[k for k in dataset.meta.video_keys if k not in depth])
@@ -94,9 +114,10 @@ class CachedLeRobotDataset(LeRobotDataset):
         return dataset  # type: ignore[return-value]
 
     @classmethod
-    def from_repo(cls, repo_id: str, cache_dir: str | Path, **kwargs: Any) -> "CachedLeRobotDataset":
+    def from_repo(cls, repo_id: str, cache_dir: str | Path, cache_mode: str = "prebuilt",
+                  **kwargs: Any) -> "CachedLeRobotDataset":
         """Same arguments as LeRobotDataset (root, episodes, delta_timestamps, image_transforms, ...)."""
-        return cls.from_dataset(LeRobotDataset(repo_id, **kwargs), cache_dir)
+        return cls.from_dataset(LeRobotDataset(repo_id, **kwargs), cache_dir, cache_mode=cache_mode)
 
     def _fastload_wrap_reader(self, rd: DatasetReader) -> None:
         if not isinstance(rd, CachedDatasetReader):

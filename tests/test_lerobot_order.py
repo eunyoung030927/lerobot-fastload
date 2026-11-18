@@ -16,6 +16,10 @@ every tensor and string, and after every epoch the torch (CPU and CUDA) / numpy 
 On CUDA the transform kernels run on the GPU, so augmented images may differ from LeRobot's CPU
 result by float rounding (reported as max abs diff, accepted below --atol); everything else must match
 exactly. Multi-process sharding: run the same script under ``accelerate launch --num_processes 2``.
+
+``--cache_mode during_training``: every case starts FastLoader on an EMPTY cache (under ``--fill_dir``), which it
+fills while serving the epochs; afterwards the cache must be complete and every file equal to the one
+``fastload.build_cache`` made (``--cache_dir``).
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import os
 import random
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +37,8 @@ import torch
 
 
 _RESIZE_HOOK_ENV = "FASTLOAD_TEST_RESIZE_HOOK"
+# Facts about the last FastLoader run of run(): per-epoch seconds, the cache filler's counters, ...
+LAST_RUN: dict = {}
 
 
 def _install_resize_hook() -> None:
@@ -137,6 +144,13 @@ def _same_states(a, b) -> bool:
             and all(np.array_equal(x, y) if isinstance(x, np.ndarray) else x == y for x, y in zip(a[1], b[1])))
 
 
+def _transform_configs():
+    """``off``: no image transforms. ``on``: lerobot_train's default augmentation (``--dataset.image_transforms.enable``)."""
+    from lerobot.transforms import ImageTransformsConfig
+
+    return {"off": None, "on": ImageTransformsConfig(enable=True, max_num_transforms=3)}
+
+
 def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
     from lerobot.datasets.sampler import EpisodeAwareSampler
@@ -173,15 +187,21 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
             prefetch_factor=4 if workers_enabled else None, persistent_workers=persistent and workers_enabled,
             multiprocessing_context="spawn" if workers_enabled else None, **common)
     else:
-        ds = CachedLeRobotDataset.from_dataset(ds, args.cache_dir)
+        mode = getattr(args, "cache_mode", "prebuilt")
+        ds = CachedLeRobotDataset.from_dataset(ds, args.cache_dir, cache_mode=mode)
         dl = FastLoader(ds, order="lerobot", num_workers=num_workers, persistent_workers=persistent,
                         placement=args.placement, device=accelerator.device, decode_hook_device=args.hook_device,
-                        augment_device=args.augment_device, **common)
+                        augment_device=args.augment_device, decode_workers=getattr(args, "decode_workers", None),
+                        background_fill=getattr(args, "background_fill", True), **common)
     dl = accelerator.prepare(dl)
 
-    batches, states = [], []
+    batches, states, epoch_s = [], [], []
+    max_batches = getattr(args, "max_batches", None) if kind == "fast" else None
     for _ in range(args.epochs):
+        t0 = time.perf_counter()
         for b in dl:
+            if max_batches is not None and len(batches) >= max_batches:
+                break  # an interrupted run (tests/test_cache_modes.py: restart)
             b = dict(b)
             b["_camera_dtypes"] = {cam: str(b[cam].dtype) for cam in cams if cam in b}  # what the loader emitted
             for cam in cams:  # lerobot_train's loop: uint8 cameras -> float32 / 255 on the device
@@ -191,8 +211,16 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
             torch.rand(1)  # a CPU draw in the training step (SmolVLA / GR00T time sampling)
             if accelerator.device.type == "cuda":
                 torch.randn(1, device=accelerator.device)  # a GPU draw (pi0.5 / diffusion noise)
+        epoch_s.append(time.perf_counter() - t0)
         states.append(_states())
+        if max_batches is not None and len(batches) >= max_batches:
+            break
     if kind == "fast":
+        LAST_RUN.clear()
+        LAST_RUN.update(epoch_s=epoch_s, complete_after_epochs=dl.cache_complete, fill_stats=dl.fill_stats)
+        if getattr(args, "finish_cache", False):
+            LAST_RUN["finished"] = dl.finish_cache()
+            LAST_RUN["fill_stats_final"] = dl.fill_stats  # including what finish_cache decoded
         dl.close()
     else:  # stop persistent workers before the next case
         base = getattr(dl, "base_dataloader", dl)
@@ -233,6 +261,31 @@ def compare(ref, got, cams, atol) -> list[str]:
     return errors
 
 
+def compare_caches(got_dir, ref_dir) -> list[str]:
+    """``got_dir`` must be a complete cache whose frame arrays, timestamps and metadata equal ``ref_dir``'s."""
+    import json
+
+    from fastload.cache import COMPLETE_FILE, FILLED_FILE, META_FILE, TIMESTAMPS_FILE
+
+    got_dir, ref_dir = Path(got_dir), Path(ref_dir)
+    errors = []
+    if not (got_dir / COMPLETE_FILE).exists():
+        errors.append(f"{got_dir}: no {COMPLETE_FILE}")
+    gm, rm = (json.loads((d / META_FILE).read_text()) for d in (got_dir, ref_dir))
+    for f in ("format_version", "info_fingerprint", "total_frames", "total_episodes", "keys", "video_backend"):
+        if gm.get(f) != rm.get(f):
+            errors.append(f"meta {f}: {gm.get(f)!r} vs {rm.get(f)!r}")
+    files = [v["file"] for v in rm["keys"].values()] + [TIMESTAMPS_FILE, FILLED_FILE]
+    for name in files:
+        a, b = np.load(got_dir / name, mmap_mode="r"), np.load(ref_dir / name, mmap_mode="r")
+        if a.dtype != b.dtype or a.shape != b.shape:
+            errors.append(f"{name}: {a.dtype}{a.shape} vs {b.dtype}{b.shape}")
+        elif not np.array_equal(a, b):
+            bad = np.unique(np.nonzero(np.asarray(a) != np.asarray(b))[0])
+            errors.append(f"{name}: {len(bad)} frames differ (first {bad[:5].tolist()})")
+    return errors
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--repo_id")
@@ -246,6 +299,8 @@ def main() -> int:
     p.add_argument("--workers", default="0,2")
     p.add_argument("--persistent", default="both", choices=["both", "on", "off"],
                    help="persistent_workers for num_workers > 0 (lerobot_train's default is on)")
+    p.add_argument("--samplers", default="random,episode_aware")
+    p.add_argument("--transforms", default="off,on", help="image transforms of the cases: off, on (comma list)")
     p.add_argument("--atol", type=float, default=1e-5)
     p.add_argument("--episodes", type=int, default=0, help="use only the first N episodes (0 = all)")
     p.add_argument("--video", action="store_true", help="synthetic dataset with mp4 videos instead of images")
@@ -257,12 +312,17 @@ def main() -> int:
     p.add_argument("--hook_device", choices=["cpu", "gpu"], default="cpu")
     p.add_argument("--augment_device", choices=["cpu", "gpu"], default="gpu",
                    help="cpu: augmented images must match LeRobot bit for bit (use with --atol 0)")
+    p.add_argument("--cache_mode", choices=["prebuilt", "during_training"], default="prebuilt",
+                   help="during_training: every case starts from an empty cache under --fill_dir and must end with a "
+                        "cache identical to --cache_dir's (build_cache)")
+    p.add_argument("--fill_dir", default=None, help="where the during_training caches go (default: a temp dir)")
+    p.add_argument("--decode_workers", type=int, default=2)
     args = p.parse_args()
+    args.finish_cache = args.cache_mode == "during_training"
 
     import subprocess
 
     from accelerate import Accelerator
-    from lerobot.transforms import ImageTransformsConfig
 
     tmp = None
     if args.repo_id is None:
@@ -281,18 +341,33 @@ def main() -> int:
         _install_resize_hook()
 
     accelerator = Accelerator(cpu=args.device == "cpu")
-    tf_on = ImageTransformsConfig(enable=True, max_num_transforms=3)
+    tf_cfgs = _transform_configs()
     pers = {"both": (False, True), "on": (True,), "off": (False,)}[args.persistent]
     cases = [(w, s, t, pw) for w in [int(x) for x in args.workers.split(",")]
-             for s in ("random", "episode_aware") for t in (None, tf_on) for pw in (pers if w > 0 else (False,))]
+             for s in args.samplers.split(",") for t in args.transforms.split(",")
+             for pw in (pers if w > 0 else (False,))]
     failed = 0
-    for w, s, t, pw in cases:
+    tag = f"[rank {accelerator.process_index}/{accelerator.num_processes}] " if accelerator.num_processes > 1 else ""
+    built_cache = args.cache_dir
+    fill_dir = Path(args.fill_dir) if args.fill_dir else (Path(tmp.name) / "fill" if tmp is not None else None)
+    if args.cache_mode == "during_training" and fill_dir is None:
+        raise SystemExit("--cache_mode during_training with --cache_dir needs --fill_dir")
+    for ci, (w, s, t, pw) in enumerate(cases):
         name = (f"num_workers={w}" + (f" persistent={'on' if pw else 'off'}" if w > 0 else "")
-                + f" sampler={s} transforms={'on' if t else 'off'}")
-        ref = run("lerobot", args, accelerator, w, s, t, pw)
-        got = run("fast", args, accelerator, w, s, t, pw)
+                + f" sampler={s} transforms={t}")
+        ref = run("lerobot", args, accelerator, w, s, tf_cfgs[t], pw)
+        if args.cache_mode == "during_training":
+            args.cache_dir = str(fill_dir / f"case{ci}")  # empty: FastLoader fills it during the epochs
+        got = run("fast", args, accelerator, w, s, tf_cfgs[t], pw)
         errors = compare(ref, got, ref[2], args.atol)
-        tag = f"[rank {accelerator.process_index}/{accelerator.num_processes}] " if accelerator.num_processes > 1 else ""
+        if args.cache_mode == "during_training":
+            st = LAST_RUN.get("fill_stats") or {}
+            print(f"    {tag}epoch times {', '.join(f'{x:.2f}s' for x in LAST_RUN['epoch_s'])}; complete after the "
+                  f"epochs: {LAST_RUN['complete_after_epochs']}; decoded {st.get('frames')} frames in "
+                  f"{st.get('tasks')} tasks ({st.get('background_frames')} in the background), waited "
+                  f"{st.get('wait_s', 0):.2f}s for frames")
+            errors += compare_caches(args.cache_dir, built_cache)
+            args.cache_dir = built_cache
         print(f"  {tag}{name}: {'OK' if not errors else 'FAIL'} ({len(ref[0])} batches)", flush=True)
         for e in errors[:8]:
             print(f"    {e}")

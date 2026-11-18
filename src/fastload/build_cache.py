@@ -9,7 +9,11 @@ Frames are decoded through LeRobot's own ``DatasetReader._query_videos`` (same b
 matching, ``return_uint8=True`` as in ``lerobot_train``), so the cache holds exactly the pixels LeRobot would
 have produced during training. Depth cameras (``meta.depth_keys``, 12-bit / float) are not cached; datasets
 read through :class:`fastload.CachedLeRobotDataset` decode them with LeRobot's code.
-The build is resumable: finished episodes are recorded under ``progress/`` and skipped on rerun.
+The build is resumable: finished episodes are recorded under ``progress/`` (and every written frame in
+``filled.npy``) and skipped on rerun. Before writing, the free disk space is checked (``--min_free_disk_gb``).
+
+The decoding workers here (``_worker_init`` / ``_decode_range``) are also the ones that fill a cache during
+training (``--fastload.cache_mode=during_training``, :mod:`fastload.fill`), so both store the same bytes.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import mmap
 import multiprocessing as mp
 import os
 import random
@@ -33,28 +38,23 @@ from fastload import _lr
 from fastload.cache import (
     CACHE_FORMAT_VERSION,
     COMPLETE_FILE,
+    DEFAULT_MIN_FREE_DISK_GB,
+    FILLED_FILE,
     META_FILE,
     PROGRESS_DIR,
     TIMESTAMPS_FILE,
+    atomic_write_text,
+    cache_file_sizes,
+    check_free_disk,
     info_fingerprint,
     key_to_filename,
+    write_complete,
 )
 
 logger = logging.getLogger("fastload.build_cache")
 
 # Decoded float32 frames held per worker at once (bytes). Keeps 480x640 videos from blowing RAM.
 _CHUNK_FLOAT_BYTES = 256 * 1024 * 1024
-
-
-def _open_dataset(repo_id: str, root: str | None, revision: str | None, video_backend: str | None,
-                  tolerance_s: float):
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
-    # return_uint8=True: video frames come back as the decoder's raw uint8 (no float round trip).
-    return LeRobotDataset(
-        repo_id, root=root, revision=revision, video_backend=video_backend, tolerance_s=tolerance_s,
-        return_uint8=True,
-    )
 
 
 def _to_uint8(frames: torch.Tensor) -> np.ndarray:
@@ -64,52 +64,79 @@ def _to_uint8(frames: torch.Tensor) -> np.ndarray:
     return frames.mul(255).round_().clamp_(0, 255).to(torch.uint8).numpy()
 
 
+def _flush_rows(arr: np.memmap, lo: int, hi: int) -> None:
+    """Flush rows ``lo:hi`` of a memmap to disk (msync of just that range; the whole map as a fallback)."""
+    try:
+        row = int(np.prod(arr.shape[1:], dtype=np.int64)) * arr.itemsize
+        mm = arr._mmap  # numpy maps from offset rounded down to the allocation granularity
+        start = arr.offset - arr.offset % mmap.ALLOCATIONGRANULARITY
+        off = arr.offset - start + lo * row
+        aligned = off - off % mmap.PAGESIZE
+        mm.flush(aligned, off - aligned + (hi - lo) * row)
+    except Exception:  # pragma: no cover - numpy internals changed
+        arr.flush()
+
+
 # ------------------------------------------------------------------------------------------------
-# worker side
+# worker side (build_cache's pool and the cache-filling pool of cache_mode=during_training)
 # ------------------------------------------------------------------------------------------------
 _W: dict[str, Any] = {}
 
 
 def _worker_init(args: dict[str, Any]) -> None:
+    from fastload.decode_hook import remove_hook
+
     torch.set_num_threads(1)
-    ds = _open_dataset(args["repo_id"], args["root"], args["revision"], args["video_backend"],
-                       args["tolerance_s"])
+    remove_hook()  # the cache stores the decoder's own frames (a spawned worker may re-import a training script)
+    ds = _lr.open_dataset_for_cache(args["repo_id"], args["root"], args["revision"], args["video_backend"],
+                                    args["tolerance_s"])
     cache_dir = Path(args["cache_dir"])
     meta = json.loads((cache_dir / META_FILE).read_text())
+    ep_from, ep_to = _lr.episode_bounds(ds.meta)
     _W.clear()
     _W.update(
         ds=ds,
         cache_dir=cache_dir,
         keys=args["keys"],
-        video_keys=set(ds.meta.video_keys),
+        ep_from=ep_from,
+        ep_to=ep_to,
         arrays={k: np.load(cache_dir / meta["keys"][k]["file"], mmap_mode="r+") for k in args["keys"]},
+        filled=np.load(cache_dir / FILLED_FILE, mmap_mode="r+"),
         timestamps=np.load(cache_dir / TIMESTAMPS_FILE, mmap_mode="r"),
         chunk={k: max(8, _CHUNK_FLOAT_BYTES // (4 * int(np.prod(meta["keys"][k]["shape"]))))
                for k in args["keys"]},
     )
 
 
-def _decode_episode(ep_idx: int) -> tuple[int, int, float]:
-    t0 = time.perf_counter()
+def _decode_range(ep_idx: int, lo: int, hi: int) -> int:
+    """Decode frames ``lo:hi`` (absolute, inside episode ``ep_idx``) of every cached camera, write and flush them,
+    then mark them filled. Concurrent writers of the same frames write the same bytes."""
     ds = _W["ds"]
-    ep = ds.meta.episodes[ep_idx]
-    start, end = int(ep["dataset_from_index"]), int(ep["dataset_to_index"])
-    ts_all = _W["timestamps"][start:end]
+    ts_all = _W["timestamps"]
     for key in _W["keys"]:
         out = _W["arrays"][key]
         step = _W["chunk"][key]
-        for s in range(0, end - start, step):
-            e = min(s + step, end - start)
-            if key in _W["video_keys"]:
-                frames = _lr.query_videos(ds, {key: [float(t) for t in ts_all[s:e]]}, ep_idx)[key]
-                if frames.ndim == 3:  # LeRobot squeezes a single-timestamp query
-                    frames = frames.unsqueeze(0)
-            else:  # image stored in parquet
-                frames = torch.stack(ds.hf_dataset[start + s:start + e][key])
-            out[start + s:start + e] = _to_uint8(frames)
-        out.flush()
+        for s in range(lo, hi, step):
+            e = min(s + step, hi)
+            out[s:e] = _to_uint8(_lr.read_frames(ds, key, ep_idx, s, e, ts_all[s:e]))
+        _flush_rows(out, lo, hi)
+    filled = _W["filled"]
+    filled[lo:hi] = 1  # only after the frames are on disk: readers never see a frame before it is complete
+    _flush_rows(filled, lo, hi)
+    return hi - lo
+
+
+def _decode_episode(ep_idx: int) -> tuple[int, int, float]:
+    t0 = time.perf_counter()
+    start, end = int(_W["ep_from"][ep_idx]), int(_W["ep_to"][ep_idx])
+    _decode_range(ep_idx, start, end)
     (_W["cache_dir"] / PROGRESS_DIR / f"ep_{ep_idx:06d}.done").touch()
     return ep_idx, end - start, time.perf_counter() - t0
+
+
+def _fill_task(ep_idx: int, lo: int, hi: int) -> tuple[int, int]:
+    """One task of the during-training filling pool (:mod:`fastload.fill`)."""
+    return lo, lo + _decode_range(ep_idx, lo, hi)
 
 
 # ------------------------------------------------------------------------------------------------
@@ -126,8 +153,15 @@ def build_cache(
     num_workers: int | None = None,
     verify: int = 32,
     overwrite: bool = False,
+    min_free_disk_gb: float | None = DEFAULT_MIN_FREE_DISK_GB,
+    layout_only: bool = False,
 ) -> Path:
-    """Build (or resume building) the cache for one LeRobot dataset. Returns the cache dir."""
+    """Build (or resume building) the cache for one LeRobot dataset. Returns the cache dir.
+
+    ``min_free_disk_gb``: refuse (before writing anything) unless ``free disk - bytes still to write`` stays at
+    least this large (None / negative = no check). ``layout_only``: only allocate the files and the ``filled``
+    bitmap (what ``cache_mode="during_training"`` fills), decode nothing.
+    """
     from fastload.decode_hook import active_hook, hook_name
 
     if active_hook() is not None:
@@ -137,7 +171,7 @@ def build_cache(
         )
     cache_dir = Path(cache_dir)
     root = str(root) if root is not None else None
-    ds = _open_dataset(repo_id, root, revision, video_backend, tolerance_s)
+    ds = _lr.open_dataset_for_cache(repo_id, root, revision, video_backend, tolerance_s)
     depth = set(_lr.depth_keys(ds.meta))
     if keys:
         keys = list(keys)
@@ -160,22 +194,17 @@ def build_cache(
     if index.shape[0] != n or not np.array_equal(index, np.arange(n)):
         raise RuntimeError("Expected the `index` column to be 0..total_frames-1; unsupported dataset layout.")
     timestamps = np.asarray(hf["timestamp"], dtype=np.float32)
+    ep_from, ep_to = _lr.episode_bounds(ds.meta)
 
     # Frame shape = what LeRobot actually returns (C, H, W), probed on frame 0.
-    shapes: dict[str, list[int]] = {}
-    for key in keys:
-        if key in ds.meta.video_keys:
-            f = _lr.query_videos(ds, {key: [float(timestamps[0])]}, int(ds.hf_dataset[0]["episode_index"]))[key]
-        else:
-            f = ds.hf_dataset[0][key]
-        shapes[key] = list(f.shape[-3:])
+    ep0 = int(np.searchsorted(ep_to, 0, side="right"))
+    shapes = {key: list(_lr.read_frames(ds, key, ep0, 0, 1, timestamps[:1]).shape[-3:]) for key in keys}
 
-    fingerprint = info_fingerprint(ds.root)
     meta = {
         "format_version": CACHE_FORMAT_VERSION,
         "repo_id": repo_id,
         "dataset_root": str(ds.root),
-        "info_fingerprint": fingerprint,
+        "info_fingerprint": info_fingerprint(ds.root),
         "total_frames": n,
         "total_episodes": int(ds.meta.total_episodes),
         "fps": int(ds.meta.fps),
@@ -203,6 +232,8 @@ def build_cache(
         resume = True
     elif cache_dir.exists() and overwrite:
         shutil.rmtree(cache_dir)
+    # Disk space before anything is written (a resumed cache only needs room for what is not on disk yet).
+    check_free_disk(cache_dir, cache_file_sizes(meta), min_free_disk_gb)
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     (cache_dir / PROGRESS_DIR).mkdir(exist_ok=True)
@@ -213,11 +244,31 @@ def build_cache(
                                             shape=(n, c, h, w))
             del arr
         np.save(cache_dir / TIMESTAMPS_FILE, timestamps)
-        meta_path.write_text(json.dumps(meta, indent=2))
+    done = {int(p.stem.split("_")[1]) for p in (cache_dir / PROGRESS_DIR).glob("ep_*.done")}
+    if not (cache_dir / FILLED_FILE).exists():
+        # A fresh cache, or one started before filled.npy existed: frames of finished episodes are filled.
+        tmp = cache_dir / f".{FILLED_FILE}.{os.getpid()}.tmp"
+        filled = np.lib.format.open_memmap(tmp, mode="w+", dtype=np.uint8, shape=(n,))
+        for e in done:
+            filled[ep_from[e]:ep_to[e]] = 1
+        filled.flush()
+        del filled
+        os.replace(tmp, cache_dir / FILLED_FILE)
+    if not resume:
+        atomic_write_text(meta_path, json.dumps(meta, indent=2))  # last: the layout is ready
+    if layout_only:
+        filled = np.load(cache_dir / FILLED_FILE, mmap_mode="r")
+        logger.info(f"{repo_id}: cache layout at {cache_dir} ({n} frames, keys={keys}, "
+                    f"{sum(cache_file_sizes(meta).values()) / 1e9:.2f} GB, {int(np.count_nonzero(filled))} frames "
+                    "already filled)")
+        return cache_dir
     (cache_dir / COMPLETE_FILE).unlink(missing_ok=True)
 
-    done = {int(p.stem.split("_")[1]) for p in (cache_dir / PROGRESS_DIR).glob("ep_*.done")}
-    todo = [e for e in range(int(ds.meta.total_episodes)) if e not in done]
+    # Episodes whose frames are all filled (e.g. by a run with cache_mode=during_training) are done as well.
+    filled = np.load(cache_dir / FILLED_FILE, mmap_mode="r")
+    todo = [e for e in range(int(ds.meta.total_episodes))
+            if e not in done and not bool(np.all(filled[ep_from[e]:ep_to[e]]))]
+    del filled
     total_gb = sum(np.prod(s) for s in shapes.values()) * n / 1e9
     logger.info(f"{repo_id}: {n} frames, keys={keys}, cache={total_gb:.1f} GB at {cache_dir}; "
                 f"{len(todo)} of {ds.meta.total_episodes} episodes to decode")
@@ -248,7 +299,7 @@ def build_cache(
 
     if verify > 0:
         _verify(ds, cache_dir, keys, verify)
-    (cache_dir / COMPLETE_FILE).write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+    write_complete(cache_dir)
     logger.info(f"done in {time.perf_counter() - t0:.0f}s -> {cache_dir}")
     return cache_dir
 
@@ -291,11 +342,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--num_workers", type=int, default=None, help="decode processes (default: cpu_count/2)")
     p.add_argument("--verify", type=int, default=32, help="random frames to check bit-exactly (0 = skip)")
     p.add_argument("--overwrite", action="store_true")
+    p.add_argument("--min_free_disk_gb", type=float, default=DEFAULT_MIN_FREE_DISK_GB,
+                   help="refuse unless free disk minus the bytes still to write stays above this (GB; a safety "
+                        "margin, not a size limit; -1 = no check)")
     a = p.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    build_cache(a.repo_id, a.cache_dir, root=a.root, revision=a.revision, video_backend=a.video_backend,
-                tolerance_s=a.tolerance_s, keys=a.keys, num_workers=a.num_workers, verify=a.verify,
-                overwrite=a.overwrite)
+    from fastload.cache import DiskSpaceError
+
+    try:
+        build_cache(a.repo_id, a.cache_dir, root=a.root, revision=a.revision, video_backend=a.video_backend,
+                    tolerance_s=a.tolerance_s, keys=a.keys, num_workers=a.num_workers, verify=a.verify,
+                    overwrite=a.overwrite, min_free_disk_gb=a.min_free_disk_gb)
+    except DiskSpaceError as e:
+        raise SystemExit(str(e)) from None
 
 
 if __name__ == "__main__":

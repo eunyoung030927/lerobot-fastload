@@ -78,8 +78,14 @@ python -m fastload.build_cache --repo_id <repo_id> --root <dataset dir> \
   256×256 with 2–3 cameras ≈ 466 GB). Put it on local NVMe, not a network mount.
 * Resumable: rerun the same command after an interruption. `--verify N` re-checks N random frames
   against LeRobot bit-exactly (default 32).
+* Disk check: before writing, `free disk - bytes still to write` must stay at least `--min_free_disk_gb`
+  (default 20), otherwise it stops with the cache size, the free space and the options (another disk, fewer
+  cameras with `--keys`, plain `lerobot-train`). This is a safety margin kept free for checkpoints and logs, not a
+  limit on the cache size; `-1` turns it off.
 * The cache is tied to the dataset's `meta/info.json`; a changed dataset needs a rebuild.
 * Depth cameras are skipped with a warning (12-bit / float frames are not cached).
+
+This step can also be left to the training run (`--fastload.cache_mode`, see [Cache modes](#cache-modes)).
 
 ## 2. Train
 
@@ -94,7 +100,11 @@ accelerate launch --num_processes 8 -m fastload.train \
 
 | option | default | meaning |
 |---|---|---|
-| `--fastload.cache_dir` | required | cache built in step 1 |
+| `--fastload.cache_dir` | required | cache built in step 1 (or by the training run, see `cache_mode`) |
+| `--fastload.cache_mode` | `prebuilt` | `prebuilt` = the cache must be complete; `build_first` = build it before training starts; `during_training` = the first epoch decodes the frames it needs into the cache ([Cache modes](#cache-modes)) |
+| `--fastload.decode_workers` | see text | decoder processes for `build_first` (default half the CPU cores) / `during_training` (default half the CPU cores divided by the training processes of the node) |
+| `--fastload.background_fill` | true | `during_training`: while decoders are idle, also decode frames no batch asked for yet, so the cache completes |
+| `--fastload.min_free_disk_gb` | 20 | `build_first` / `during_training`: free disk that must remain after the cache is written (safety margin, not a size limit; -1 = off) |
 | `--fastload.order` | `lerobot` | `lerobot` = LeRobot's batches, order and data RNG (keep `--num_workers` as in your LeRobot runs); `shard` = each rank owns whole episodes (largest VRAM hit rate on many GPUs, different order) |
 | `--fastload.loader` | `fast` | `fast` = FastLoader; `dataloader` = LeRobot's DataLoader reading the cache (no VRAM tier) |
 | `--fastload.placement` | `auto` | `auto` grows a VRAM tier after warm-up; `gpu` puts the whole shard in VRAM at start; `host` never uses VRAM |
@@ -111,6 +121,60 @@ With `loader=fast` no worker processes are started: `num_workers` and `persisten
 emulated worker RNG streams for image augmentation, and `pin_memory` / `prefetch_factor` /
 `multiprocessing_context` are ignored.
 
+## Cache modes
+
+`--fastload.cache_mode` decides where the cache comes from. The default stays `prebuilt`.
+
+| mode | what happens | use it when |
+|---|---|---|
+| `prebuilt` (default) | the cache from step 1 must be complete; otherwise training stops at once with an error that names the other two modes and the `build_cache` command | the cache is built ahead (one build, many runs, several nodes copying one cache) |
+| `build_first` | a missing or incomplete cache is built (resumably, by `build_cache`'s code) before training starts, then training runs on the complete cache | you want one command, and the dataset is decoded faster in bulk than training would read it |
+| `during_training` | no separate step: the cache files are allocated, and FastLoader's first epoch decodes the frames its batches need (in decoder processes) and stores them; later epochs read the cache | you want training to start right away; the first epoch runs at about video-decoding speed, the rest at cache speed |
+
+All three give LeRobot's batches, order, RNG states and augmentation exactly as with a prebuilt cache
+(`tests/test_cache_modes.py`), and all three store the same bytes (`build_first` and `during_training` decode with
+`build_cache`'s worker code through LeRobot's own reader).
+
+**`build_first`** runs before `lerobot_train.train()`, i.e. before the Accelerator and the process group exist, so a
+long build cannot run into an NCCL / accelerate timeout or one of LeRobot's barriers. The dataset is taken from the
+`--dataset.repo_id`, `--dataset.root`, `--dataset.revision`, `--dataset.video_backend` and `--tolerance_s` arguments,
+or, when resuming with `--config_path=.../train_config.json`, from that file (command-line values win).
+
+**`during_training`** in detail:
+
+* Storage: the frame files are allocated at full size up front, plus `filled.npy` (one byte per frame). A decoder
+  writes a frame, flushes it, and only then sets its byte, so nothing reads a frame before it is complete. A
+  stopped or crashed run leaves the filled frames in place and the next run decodes only the rest. When every frame
+  is filled, `COMPLETE` is written (atomic rename) and the directory is an ordinary prebuilt cache.
+* Decoding: a pool of `--fastload.decode_workers` processes. The prefetch thread hands it the frames of the next
+  batches that are not cached yet (observation history included), at least 8 batches ahead, and waits before
+  assembling a batch until its frames are filled (at least 4 batches are prepared ahead in this mode). While
+  decoders are idle they decode the remaining frames in order (`--fastload.background_fill`), so the cache
+  completes even for frames training never reads (e.g. LeRobot's dropped last frames of each episode).
+* Exactness: decoding happens in other processes, so the training process's RNG is untouched, and frames are read
+  only once stored; batches and RNG states are those of a prebuilt run. `augment_device`, decode-hook wrappers and
+  `return_uint8` behave as with a prebuilt cache (decoder processes undo a wrapper so the cache holds the decoder's
+  own frames, as `build_cache` requires).
+* VRAM tier: not built while frames are missing; it is built (sized from the memory measured then) once the cache
+  is complete, and `memory_guard` works as usual from then on.
+* Needs `--fastload.loader=fast` (FastLoader does the filling). Indexing a `CachedLeRobotDataset` whose frames are
+  not filled yet decodes them with LeRobot's own code.
+
+**Several processes** (`accelerate launch` / `torchrun`): the cache directory is node-local. On each node only
+`LOCAL_RANK` 0 builds (`build_first`) or allocates (`during_training`) the cache; the other local ranks log that they
+wait, poll for it, and stop with the leader's error if it failed (the leader leaves a marker in the temp directory).
+With `during_training` all ranks of a node fill the same files: each rank's decoders write the frames its batches
+need (a frame written by two ranks gets identical bytes), any rank sets `filled` bytes after its own writes, and
+`COMPLETE` is written by an atomic rename. Ranks on different nodes each fill their own local copy. Do not point
+ranks of different nodes at one shared directory.
+
+**Disk check** (`--fastload.min_free_disk_gb`, `build_cache --min_free_disk_gb`, default 20): before anything is
+written, `free disk - bytes still to write` must stay at least this large (a resumed or partly filled cache only
+counts what is not on disk yet). Otherwise the run stops, before creating any cache file, with the cache size, the
+free space and the options: put the cache on another disk (`--fastload.cache_dir`), cache fewer cameras
+(`build_cache --keys`, then `--fastload.loader=dataloader` decodes the others), or train with plain `lerobot-train`.
+It is a safety margin kept free for checkpoints, logs and the system, not a limit on the cache size.
+
 ## Custom training scripts
 
 ```python
@@ -126,6 +190,9 @@ for batch in dataloader:   # one epoch of this rank's batches; tensors already o
     ...
 ```
 
+`make_loader(..., cache_mode="during_training")` fills a missing cache while it serves batches (`"build_first"`
+builds it first); with several processes call it from every rank, as above.
+
 `dataset` is your `LeRobotDataset` (delta timestamps, image transforms and `return_uint8` are taken from it;
 with `return_uint8=True` video cameras arrive as uint8 and your loop divides by 255, as in `lerobot_train`).
 `fastload.CachedLeRobotDataset.from_dataset(dataset, cache_dir)` alone gives a drop-in dataset for an
@@ -134,6 +201,7 @@ ordinary `DataLoader` (any `num_workers`) if you only want to skip video decodin
 ## Benchmark and test on your data
 
 ```bash
+python tests/test_cache_modes.py        # cache modes on synthetic data (CPU)
 python tests/test_equivalence.py --repo_id <repo_id> --root <dir> --cache_dir <cache>
 python benchmarks/bench_loader.py --repo_id <repo_id> --root <dir> --cache_dir <cache> --batch 32
 torchrun --nproc_per_node 2 benchmarks/bench_loader.py ... --modes fast_host,fast_gpu
