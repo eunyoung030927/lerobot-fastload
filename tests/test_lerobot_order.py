@@ -257,7 +257,9 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
             b["_camera_dtypes"] = {cam: str(b[cam].dtype) for cam in cams if cam in b}  # what the loader emitted
             # lerobot_train's loop: uint8 cameras -> float32 / 255 on the device (no rename, identity preprocessor)
             b = lt._preprocess_dataset_batch(b, cams, {}, lambda x: x)
-            batches.append({k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v) for k, v in b.items()})
+            # clone: a worker's tensors arrive in shared memory, one open file each until freed; keeping them all
+            # would exceed the open-file limit (ulimit -n 1024) on larger test datasets
+            batches.append({k: (v.detach().cpu().clone() if isinstance(v, torch.Tensor) else v) for k, v in b.items()})
             torch.rand(1)  # a CPU draw in the training step (SmolVLA / GR00T / pi0.5 time sampling)
             np.random.rand()
             random.random()
