@@ -48,13 +48,13 @@ def make_loader(dataset: Any, batch_size: int, *, cache_dir: str | None = None, 
     returns the same FastLoader; with the default ``order="lerobot"`` it shards and seeds the batch order
     exactly as it would a DataLoader (required with several processes). Pass the ``num_workers`` of the
     DataLoader you are replacing so image-transform randomness matches. Keyword arguments are those of
-    :class:`fastload.loader.FastLoader` (sampler, shuffle, order, num_workers, placement, ...).
+    :class:`fastload.loader.FastLoader` (sampler, shuffle, order, num_workers, placement, ...), including
+    ``cache_mode="during_training"`` (no separate build step: the loader decodes missing frames into the cache).
     """
     from fastload.dataset import CachedLeRobotDataset
     from fastload.loader import FastLoader
 
-    if not isinstance(dataset, CachedLeRobotDataset):
-        if cache_dir is None:
-            raise ValueError("pass cache_dir=... (or a CachedLeRobotDataset)")
-        dataset = CachedLeRobotDataset.from_dataset(dataset, cache_dir)
-    return FastLoader(dataset, batch_size, **kwargs)
+    if not isinstance(dataset, CachedLeRobotDataset) and cache_dir is None:
+        raise ValueError("pass cache_dir=... (or a CachedLeRobotDataset)")
+    # FastLoader converts the dataset (cache_mode / min_free_disk_gb / decode_workers apply there)
+    return FastLoader(dataset, batch_size, cache_dir=cache_dir, **kwargs)
