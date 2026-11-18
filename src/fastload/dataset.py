@@ -1,4 +1,4 @@
-"""LeRobotDataset that reads camera frames from a fastload cache instead of decoding video."""
+"""LeRobotDataset that reads camera frames from a fastload cache instead of decoding video (LeRobot 0.5.x)."""
 
 from __future__ import annotations
 
@@ -12,44 +12,26 @@ from fastload._lerobot_version import check_lerobot_version
 
 check_lerobot_version()
 
+from lerobot.datasets.dataset_reader import DatasetReader  # noqa: E402
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 
+from fastload import _lr  # noqa: E402
 from fastload.cache import FrameCache  # noqa: E402
 from fastload.decode_hook import active_hook, apply_hook  # noqa: E402
 
 
-class CachedLeRobotDataset(LeRobotDataset):
-    """Drop-in LeRobotDataset whose ``_query_videos`` reads uint8 frames from the cache.
+class CachedDatasetReader(DatasetReader):
+    """LeRobot's DatasetReader whose ``_query_videos`` reads uint8 frames from the cache.
 
-    Everything else (parquet rows, delta timestamps, padding, image transforms, task strings) is
-    LeRobot's own code, so ``dataset[i]`` is identical to the original dataset's ``dataset[i]``.
-    Works with a regular ``torch.utils.data.DataLoader`` (any ``num_workers``) and is also the input
-    of :class:`fastload.loader.FastLoader`.
+    Everything else in ``get_item`` (parquet rows, delta timestamps, padding, image transforms, task
+    strings) is LeRobot's own code, so items are identical to the original reader's.
     """
 
     fastload_cache: FrameCache
 
-    @classmethod
-    def from_dataset(cls, dataset: LeRobotDataset, cache_dir: str | Path) -> "CachedLeRobotDataset":
-        """Convert an existing LeRobotDataset in place (keeps all of its configuration)."""
-        if isinstance(dataset, cls):
-            return dataset
-        if type(dataset) is not LeRobotDataset:
-            raise TypeError(f"Only plain LeRobotDataset is supported, got {type(dataset).__name__}.")
-        cache = FrameCache(cache_dir)
-        cache.check_compatible(dataset, keys=list(dataset.meta.video_keys))
-        dataset.__class__ = cls
-        dataset._fastload_attach(cache)
-        return dataset  # type: ignore[return-value]
-
-    @classmethod
-    def from_repo(cls, repo_id: str, cache_dir: str | Path, **kwargs: Any) -> "CachedLeRobotDataset":
-        """Same arguments as LeRobotDataset (root, episodes, delta_timestamps, image_transforms, ...)."""
-        return cls.from_dataset(LeRobotDataset(repo_id, **kwargs), cache_dir)
-
     def _fastload_attach(self, cache: FrameCache) -> None:
         self.fastload_cache = cache
-        episodes = self.meta.episodes
+        episodes = self._meta.episodes
         self._fl_ep_from = np.asarray(episodes["dataset_from_index"], dtype=np.int64)
         self._fl_ep_to = np.asarray(episodes["dataset_to_index"], dtype=np.int64)
 
@@ -63,20 +45,62 @@ class CachedLeRobotDataset(LeRobotDataset):
             if key not in cache.keys:
                 fallback[key] = query_ts
                 continue
-            rel = _nearest(ep_ts, np.asarray(query_ts, dtype=np.float64), self.tolerance_s, key, ep_idx)
+            rel = _nearest(ep_ts, np.asarray(query_ts, dtype=np.float64), self._tolerance_s, key, ep_idx)
             frames = np.asarray(cache.array(key)[start + rel])  # [T, C, H, W] uint8 copy
             # Same arithmetic as LeRobot's decoders: uint8 -> float32, then / 255.
             frames = torch.from_numpy(frames).to(torch.float32) / 255
             hook = active_hook()
             if hook is not None:  # a wrapper around decode_video_frames (e.g. a resize) runs as with LeRobot
-                ep = self.meta.episodes[ep_idx]
+                ep = self._meta.episodes[ep_idx]
                 shifted = [ep[f"videos/{key}/from_timestamp"] + ts for ts in query_ts]
-                path = self.root / self.meta.get_video_file_path(ep_idx, key)
-                frames = apply_hook(hook, frames, path, shifted, self.tolerance_s, self.video_backend)
+                path = self.root / self._meta.get_video_file_path(ep_idx, key)
+                frames = apply_hook(hook, frames, path, shifted, self._tolerance_s, self._video_backend)
             item[key] = frames.squeeze(0)
         if fallback:
             item.update(super()._query_videos(fallback, ep_idx))
         return item
+
+
+class CachedLeRobotDataset(LeRobotDataset):
+    """Drop-in LeRobotDataset whose reader takes video frames from the cache.
+
+    Works with a regular ``torch.utils.data.DataLoader`` (any ``num_workers``) and is also the input
+    of :class:`fastload.loader.FastLoader`.
+    """
+
+    fastload_cache: FrameCache
+
+    @classmethod
+    def from_dataset(cls, dataset: LeRobotDataset, cache_dir: str | Path) -> "CachedLeRobotDataset":
+        """Convert an existing LeRobotDataset in place (keeps all of its configuration)."""
+        if isinstance(dataset, cls):
+            return dataset
+        if type(dataset) is not LeRobotDataset:
+            raise TypeError(f"Only plain LeRobotDataset is supported, got {type(dataset).__name__}.")
+        rd = _lr.reader(dataset)
+        if type(rd) is not DatasetReader:
+            raise TypeError(f"Only LeRobot's DatasetReader is supported, got {type(rd).__name__}.")
+        cache = FrameCache(cache_dir)
+        cache.check_compatible(dataset, keys=list(dataset.meta.video_keys))
+        dataset.__class__ = cls
+        dataset.fastload_cache = cache
+        dataset._fastload_wrap_reader(rd)
+        return dataset  # type: ignore[return-value]
+
+    @classmethod
+    def from_repo(cls, repo_id: str, cache_dir: str | Path, **kwargs: Any) -> "CachedLeRobotDataset":
+        """Same arguments as LeRobotDataset (root, episodes, delta_timestamps, image_transforms, ...)."""
+        return cls.from_dataset(LeRobotDataset(repo_id, **kwargs), cache_dir)
+
+    def _fastload_wrap_reader(self, rd: DatasetReader) -> None:
+        if not isinstance(rd, CachedDatasetReader):
+            rd.__class__ = CachedDatasetReader
+            rd._fastload_attach(self.fastload_cache)
+
+    def _ensure_reader(self) -> DatasetReader:
+        rd = super()._ensure_reader()  # LeRobot may create the reader lazily
+        self._fastload_wrap_reader(rd)
+        return rd
 
 
 def _nearest(ep_ts: np.ndarray, query: np.ndarray, tolerance_s: float, key: str, ep_idx: int) -> np.ndarray:

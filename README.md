@@ -29,7 +29,7 @@ mp4 ──(once)──► uint8 cache on local disk ──► page cache (RAM, s
   and moves as many frames to VRAM as fit. Frames not in VRAM are gathered from the cache by a background
   thread and copied on a side CUDA stream.
 
-Tested with LeRobot 0.4.2 and 0.4.4.
+**This branch (`lerobot-0.5`) is for LeRobot 0.5.x** (tested with 0.5.1 on CPU; Python >= 3.12).
 
 ## Install
 
@@ -167,8 +167,8 @@ is renamed to `<output_dir>.oom<N>`.
 
 ## Data-loader code that wraps LeRobot's video decoder
 
-Training scripts sometimes change frames right after decoding by wrapping
-`lerobot.datasets.lerobot_dataset.decode_video_frames` (e.g. resizing 480x640 to 240x320 in the DataLoader
+Training scripts sometimes change frames right after decoding by wrapping the `decode_video_frames` that
+LeRobot's reader calls (LeRobot 0.5: `lerobot.datasets.dataset_reader.decode_video_frames`) (e.g. resizing 480x640 to 240x320 in the DataLoader
 workers). fastload never decodes video, so it calls that wrapper itself with LeRobot's backend decoder
 answering with the cached frames: the wrapper's own code runs on exactly the frames LeRobot's decoder would
 return, at the same point (before `image_transforms`). With `--fastload.decode_hook_device=cpu` (default)

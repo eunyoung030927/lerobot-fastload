@@ -179,9 +179,13 @@ def main() -> int:
         subprocess.check_call([sys.executable, "-m", "fastload.build_cache", "--repo_id", args.repo_id, "--root",
                                args.root, "--cache_dir", args.cache_dir, "--num_workers", "1", "--verify", "8"])
     if args.decode_hook == "resize":
-        import torch.nn.functional as F
-        import lerobot.datasets.lerobot_dataset as lds
+        import importlib
 
+        import torch.nn.functional as F
+
+        from fastload._lr import DECODE_MODULE
+
+        lds = importlib.import_module(DECODE_MODULE)  # where LeRobot's reader looks up decode_video_frames
         decode = lds.decode_video_frames
 
         def decode_resized(*a, **k):

@@ -41,6 +41,7 @@ import numpy as np
 import torch
 from torch.utils.data.dataloader import DataLoader as _TorchDataLoader
 
+from fastload import _lr
 from fastload.dataset import CachedLeRobotDataset
 from fastload.decode_hook import active_hook, apply_hook, hook_name
 from fastload.rng import IndexDataset, TransformReplayer, WorkerRNG, collate_rows
@@ -240,11 +241,11 @@ class FastLoader:
                               if self._subtask_np is not None else None)
         self._ep_from_np = np.asarray(meta.episodes["dataset_from_index"], dtype=np.int64)
         self._ep_to_np = np.asarray(meta.episodes["dataset_to_index"], dtype=np.int64)
-        self.delta_np = {k: np.asarray(v, dtype=np.int64) for k, v in (dataset.delta_indices or {}).items()}
+        self.delta_np = {k: np.asarray(v, dtype=np.int64) for k, v in (_lr.delta_indices(dataset) or {}).items()}
 
         # absolute frame index -> row of hf_dataset (only differs when a subset of episodes is loaded)
         rel = None
-        if dataset._absolute_to_relative_idx is not None:
+        if _lr.absolute_to_relative_idx(dataset) is not None:
             rel = np.full(int(meta.total_frames), -1, dtype=np.int64)
             rel[self._index_np] = np.arange(len(self._index_np))
         to_dev = (lambda t: t.to(self.device)) if self.is_cuda else (lambda t: t)
@@ -278,7 +279,7 @@ class FastLoader:
             self.placement = "host"
 
         # ---- image transforms: parameters drawn on the CPU, kernels applied on the device -------
-        tf = dataset.image_transforms
+        tf = _lr.image_transforms(dataset)
         self.replayer = TransformReplayer(tf) if tf is not None else None
         # augment_device="cpu": images take LeRobot's exact path (uint8 -> float32 / 255 -> decode hook ->
         # transforms, all on the CPU), so they are bit-identical; no camera can use the GPU tier then.
@@ -540,7 +541,7 @@ class FastLoader:
         ds = self.dataset
         ep_idx = int(self._episode_np[row]) if row is not None else int(self._episode_np[0])
         path = ds.root / ds.meta.get_video_file_path(ep_idx, key)
-        return apply_hook(self.decode_hook, frames, path, list(ts), ds.tolerance_s, ds.video_backend)
+        return apply_hook(self.decode_hook, frames, path, list(ts), _lr.tolerance_s(ds), _lr.video_backend(ds))
 
     def _hook_timestamps(self, key: str, q: np.ndarray, ep: np.ndarray) -> list[list[float]]:
         """The timestamps LeRobot passes to decode_video_frames for each sample (episode-shifted)."""

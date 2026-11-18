@@ -8,9 +8,9 @@ version = "0.1.0"
 description = "Decode LeRobot videos once and train from a uint8 frame cache in RAM and VRAM"
 readme = "README.md"
 license = { text = "Apache-2.0" }
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
-    "lerobot>=0.4.2,<0.5",
+    "lerobot>=0.5,<0.6",
     "numpy",
     "torch",
 ]

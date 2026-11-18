@@ -5,7 +5,7 @@ Usage::
     python -m fastload.build_cache --repo_id <repo> --root <dataset dir> --cache_dir <out dir> \
         --num_workers 16
 
-Frames are decoded through ``LeRobotDataset._query_videos`` itself (same backend, same timestamp
+Frames are decoded through LeRobot's own ``DatasetReader._query_videos`` (same backend, same timestamp
 matching), so the cache holds exactly the pixels LeRobot would have produced during training.
 The build is resumable: finished episodes are recorded under ``progress/`` and skipped on rerun.
 """
@@ -25,6 +25,8 @@ from typing import Any
 
 import numpy as np
 import torch
+
+from fastload import _lr
 
 from fastload.cache import (
     CACHE_FORMAT_VERSION,
@@ -93,7 +95,7 @@ def _decode_episode(ep_idx: int) -> tuple[int, int, float]:
         for s in range(0, end - start, step):
             e = min(s + step, end - start)
             if key in _W["video_keys"]:
-                frames = ds._query_videos({key: [float(t) for t in ts_all[s:e]]}, ep_idx)[key]
+                frames = _lr.query_videos(ds, {key: [float(t) for t in ts_all[s:e]]}, ep_idx)[key]
                 if frames.ndim == 3:  # LeRobot squeezes a single-timestamp query
                     frames = frames.unsqueeze(0)
             else:  # image stored in parquet
@@ -148,7 +150,7 @@ def build_cache(
     shapes: dict[str, list[int]] = {}
     for key in keys:
         if key in ds.meta.video_keys:
-            f = ds._query_videos({key: [float(timestamps[0])]}, int(ds.hf_dataset[0]["episode_index"]))[key]
+            f = _lr.query_videos(ds, {key: [float(timestamps[0])]}, int(ds.hf_dataset[0]["episode_index"]))[key]
         else:
             f = ds.hf_dataset[0][key]
         shapes[key] = list(f.shape[-3:])
@@ -162,7 +164,7 @@ def build_cache(
         "total_frames": n,
         "total_episodes": int(ds.meta.total_episodes),
         "fps": int(ds.meta.fps),
-        "video_backend": ds.video_backend,
+        "video_backend": _lr.video_backend(ds),
         "tolerance_s": tolerance_s,
         "keys": {k: {"file": key_to_filename(k), "shape": shapes[k], "dtype": "uint8",
                      "source": "video" if k in ds.meta.video_keys else "image"} for k in keys},
@@ -242,8 +244,9 @@ def _verify(ds, cache_dir: Path, keys: list[str], n_samples: int) -> None:
     arrays = {k: np.load(cache_dir / meta["keys"][k]["file"], mmap_mode="r") for k in keys}
     rng = random.Random(0)
     idxs = rng.sample(range(len(ds)), min(n_samples, len(ds)))
-    saved_delta, ds.delta_indices = ds.delta_indices, None
-    saved_tf, ds.image_transforms = ds.image_transforms, None
+    saved_delta, saved_tf = _lr.delta_indices(ds), _lr.image_transforms(ds)
+    _lr.set_delta_indices(ds, None)
+    _lr.set_image_transforms(ds, None)
     try:
         for i in idxs:
             item = ds[i]
@@ -254,7 +257,8 @@ def _verify(ds, cache_dir: Path, keys: list[str], n_samples: int) -> None:
                     diff = (ref - got).abs().max().item()
                     raise RuntimeError(f"verify failed: frame {i} key {k} differs (max abs diff {diff:.3g})")
     finally:
-        ds.delta_indices, ds.image_transforms = saved_delta, saved_tf
+        _lr.set_delta_indices(ds, saved_delta)
+        _lr.set_image_transforms(ds, saved_tf)
     logger.info(f"verify: {len(idxs)} random frames x {len(keys)} keys match LeRobotDataset exactly")
 
 

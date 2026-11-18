@@ -1,11 +1,11 @@
 """Post-decode hooks: user code that wraps LeRobot's ``decode_video_frames``.
 
 Some training scripts change frames right after video decoding by wrapping
-``lerobot.datasets.lerobot_dataset.decode_video_frames``, e.g. resizing 480x640 to 240x320 in the data
+``lerobot.datasets.dataset_reader.decode_video_frames`` (LeRobot 0.5; 0.4: ``lerobot_dataset``), e.g. resizing 480x640 to 240x320 in the data
 loader workers::
 
-    decode = lerobot_dataset.decode_video_frames
-    lerobot_dataset.decode_video_frames = lambda *a, **k: resize(decode(*a, **k))
+    decode = dataset_reader.decode_video_frames
+    dataset_reader.decode_video_frames = lambda *a, **k: resize(decode(*a, **k))
 
 fastload never decodes video, so such a wrapper would silently stop running. Instead fastload calls the
 wrapper itself with LeRobot's backend decoders temporarily answering with the cached frames: the wrapper
@@ -53,10 +53,12 @@ def _install() -> None:
 
 
 def active_hook() -> Callable | None:
-    """The wrapper installed around ``lerobot_dataset.decode_video_frames``, or None."""
-    import lerobot.datasets.lerobot_dataset as lds
+    """The wrapper installed around the decode_video_frames that LeRobot's reader calls, or None."""
+    import importlib
 
-    fn = lds.decode_video_frames
+    from fastload._lr import DECODE_MODULE
+
+    fn = importlib.import_module(DECODE_MODULE).decode_video_frames
     return None if fn is _vu().decode_video_frames else fn
 
 

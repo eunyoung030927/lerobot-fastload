@@ -58,7 +58,14 @@ def _lerobot_subset_indexing_fixed() -> bool:
 
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    return "_get_query_indices(abs_idx" in inspect.getsource(LeRobotDataset.__getitem__)
+    src = inspect.getsource(LeRobotDataset.__getitem__)
+    try:  # LeRobot >= 0.5 reads items in DatasetReader.get_item
+        from lerobot.datasets.dataset_reader import DatasetReader
+
+        src += inspect.getsource(DatasetReader.get_item)
+    except ImportError:
+        pass
+    return "_get_query_indices(abs_idx" in src
 
 
 def _pick_rows(ds, n: int, seed: int = 0) -> list[int]:
@@ -125,6 +132,26 @@ def run(repo_id: str, root: str | None, cache_dir: str, n: int = 48, batch: int 
     for i in rows:
         _eq(cached[i], ref[i], f"item[{i}]", errors)
     print(f"  CachedLeRobotDataset items ({len(rows)} rows): {'OK' if not errors else 'FAIL'}")
+    if meta.video_keys:  # the cached dataset must not decode video at all (equal items alone would not show it)
+        import lerobot.datasets.video_utils as vu
+
+        names = [n for n in dir(vu) if n.startswith("decode_video_frames")]
+        saved = {n: getattr(vu, n) for n in names}
+
+        def refuse(*a, **k):
+            raise AssertionError("video decoded")
+
+        try:
+            for name in names:
+                setattr(vu, name, refuse)
+            cached[rows[0]]
+            print("  CachedLeRobotDataset decodes no video: OK")
+        except AssertionError:
+            errors.append("CachedLeRobotDataset still decodes video (cache not used)")
+            print("  CachedLeRobotDataset decodes no video: FAIL")
+        finally:
+            for name, fn in saved.items():
+                setattr(vu, name, fn)
     check_loader(ref, cached, rows, "full")
 
     # 3: subset of episodes (non-contiguous)
