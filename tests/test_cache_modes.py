@@ -84,6 +84,9 @@ class Data:
         self.variant = variant
         self.root = work / f"ds_{variant}_{episodes}"
         self.cache = work / f"cache_{variant}_{episodes}"
+        if (self.cache / "COMPLETE").exists():  # made earlier in this work dir (restart and timing share one)
+            self.repo_id = "fastload/synthetic"
+            return
         self.repo_id = make_synthetic(self.root, episodes=episodes, videos=variant == "video")
         p = _run([sys.executable, "-m", "fastload.build_cache", "--repo_id", self.repo_id, "--root", self.root,
                   "--cache_dir", self.cache, "--num_workers", "1", "--verify", "8"])
