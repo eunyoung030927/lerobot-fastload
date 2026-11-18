@@ -21,6 +21,7 @@ exactly. Multi-process sharding: run the same script under ``accelerate launch -
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import sys
 import tempfile
@@ -28,6 +29,40 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+
+_RESIZE_HOOK_ENV = "FASTLOAD_TEST_RESIZE_HOOK"
+
+
+def _install_resize_hook() -> None:
+    """Wrap LeRobot's decode_video_frames with a half-size resize (a data-loader resize as a training script
+    would write it). Since LeRobot 0.6 lerobot_train reads with return_uint8=True, so for uint8 input it resizes
+    in float and rounds back to uint8, keeping the dtype LeRobot's pipeline expects."""
+    import importlib
+
+    import torch.nn.functional as F
+
+    from fastload._lr import DECODE_MODULE
+
+    lds = importlib.import_module(DECODE_MODULE)  # where LeRobot's reader looks up decode_video_frames
+    if getattr(lds.decode_video_frames, "_fastload_test_resize", False):
+        return
+    decode = lds.decode_video_frames
+
+    def decode_resized(*a, **k):
+        x = decode(*a, **k)
+        size = (x.shape[-2] // 2, x.shape[-1] // 2)
+        if x.dtype == torch.uint8:
+            y = F.interpolate(x.to(torch.float32), size=size, mode="bilinear", antialias=True)
+            return y.round_().clamp_(0, 255).to(torch.uint8)
+        return F.interpolate(x, size=size, mode="bilinear", antialias=True)
+
+    decode_resized._fastload_test_resize = True
+    lds.decode_video_frames = decode_resized
+
+
+if os.environ.get(_RESIZE_HOOK_ENV) == "1":  # spawned DataLoader worker of a --decode_hook resize run
+    _install_resize_hook()
 
 
 def make_synthetic(root: Path, episodes: int = 6, fps: int = 10, videos: bool = False, language: bool = False) -> str:
@@ -240,27 +275,10 @@ def main() -> int:
         subprocess.check_call([sys.executable, "-m", "fastload.build_cache", "--repo_id", args.repo_id, "--root",
                                args.root, "--cache_dir", args.cache_dir, "--num_workers", "1", "--verify", "8"])
     if args.decode_hook == "resize":
-        import importlib
-
-        import torch.nn.functional as F
-
-        from fastload._lr import DECODE_MODULE
-
-        lds = importlib.import_module(DECODE_MODULE)  # where LeRobot's reader looks up decode_video_frames
-        decode = lds.decode_video_frames
-
-        def decode_resized(*a, **k):
-            # A data-loader resize as a training script would write it. lerobot_train reads with return_uint8=True
-            # since LeRobot 0.6, so the decoder returns uint8: resize in float and round back to uint8 to keep the
-            # dtype LeRobot's pipeline (transforms on uint8, loop-side / 255) expects.
-            x = decode(*a, **k)
-            size = (x.shape[-2] // 2, x.shape[-1] // 2)
-            if x.dtype == torch.uint8:
-                y = F.interpolate(x.to(torch.float32), size=size, mode="bilinear", antialias=True)
-                return y.round_().clamp_(0, 255).to(torch.uint8)
-            return F.interpolate(x, size=size, mode="bilinear", antialias=True)
-
-        lds.decode_video_frames = decode_resized
+        # Spawned DataLoader workers (multiprocessing_context="spawn" since LeRobot 0.6) re-import this module, so
+        # the wrapper is installed at import time, like a training script that installs it at module level.
+        os.environ[_RESIZE_HOOK_ENV] = "1"
+        _install_resize_hook()
 
     accelerator = Accelerator(cpu=args.device == "cpu")
     tf_on = ImageTransformsConfig(enable=True, max_num_transforms=3)
