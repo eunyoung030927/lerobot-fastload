@@ -82,3 +82,14 @@ def apply_hook(hook: Callable, frames: torch.Tensor, video_path: str | Path, tim
             "cannot be applied to cached frames"
         )
     return out
+
+
+def remove_hook() -> None:
+    """Undo a wrapper around ``lerobot_dataset.decode_video_frames``, in this process only. For processes that only
+    decode into the cache (build_cache / cache-filling workers): the cache stores the decoder's own frames and the
+    wrapper is applied at training time. A spawned worker re-imports the training script, which may install the
+    wrapper at import time."""
+    import lerobot.datasets.lerobot_dataset as lds
+
+    if lds.decode_video_frames is not _vu().decode_video_frames:
+        lds.decode_video_frames = _vu().decode_video_frames
