@@ -28,6 +28,11 @@ it. The prefetch thread asks it for the frames of the next batches (cache misses
 included) and waits, before reading a batch, until that batch's frames are filled. Nothing else changes: batches,
 order and RNG draws are those of a complete cache, since decoding happens in other processes and the frames are
 stored before they are read. The GPU tier waits until the cache is complete.
+
+Size-limited cache (``max_cache_gb``): the frames of the episodes it does not store are decoded for the batches that
+need them by the same decoder processes (:class:`fastload.fill.TransientFrames`), a few batches ahead, into a small
+scratch area, and gathered with the cached frames. Again only the source of the bytes changes, not batches, order or
+RNG draws. The GPU tier holds stored frames only.
 """
 
 from __future__ import annotations
@@ -48,7 +53,7 @@ import torch
 from torch.utils.data.dataloader import DataLoader as _TorchDataLoader
 
 from fastload import _lr
-from fastload.cache import DEFAULT_MIN_FREE_DISK_GB
+from fastload.cache import DEFAULT_MAX_CACHE_GB, DEFAULT_MIN_FREE_DISK_GB
 from fastload.dataset import CachedLeRobotDataset
 from fastload.decode_hook import active_hook, apply_hook, hook_name
 from fastload.rng import IndexDataset, TransformReplayer, WorkerRNG, collate_rows
@@ -174,6 +179,9 @@ class FastLoader:
             completes (and becomes a regular prebuilt cache) even if training never reads some frames.
         min_free_disk_gb: free disk that must remain after the cache is written (``cache_mode`` other than
             prebuilt); a safety margin, not a size limit.
+        max_cache_gb: size limit of a cache created here (``cache_mode`` build_first / during_training): a larger
+            dataset stores whole episodes up to this size; the decoder processes decode the others for the batches
+            that need them. A prebuilt cache keeps the limit it was built with.
     """
 
     def __init__(
@@ -203,13 +211,14 @@ class FastLoader:
         decode_workers: int | None = None,
         background_fill: bool = True,
         min_free_disk_gb: float | None = DEFAULT_MIN_FREE_DISK_GB,
+        max_cache_gb: float | None = DEFAULT_MAX_CACHE_GB,
     ):
         if not isinstance(dataset, CachedLeRobotDataset):
             if cache_dir is None:
                 raise ValueError("dataset is not a CachedLeRobotDataset; pass cache_dir=...")
             dataset = CachedLeRobotDataset.from_dataset(dataset, cache_dir, cache_mode=cache_mode,
                                                         min_free_disk_gb=min_free_disk_gb,
-                                                        build_workers=decode_workers)
+                                                        build_workers=decode_workers, max_cache_gb=max_cache_gb)
         if placement not in PLACEMENTS:
             raise ValueError(f"placement must be one of {PLACEMENTS}, got {placement!r}")
         if order not in ORDERS:
@@ -349,13 +358,25 @@ class FastLoader:
         self._epoch = 0
         self._grown = self.placement != "auto"
         # ---- an incomplete cache (cache_mode="during_training"): decoder processes fill it -------------------
+        # ---- a size-limited cache: the same processes decode the frames it does not store ------------------
         self._filler = None
         self._fill_lookahead = max(8, 2 * self.prefetch)  # batches whose frames are requested ahead
-        if not self.cache.complete:
+        self._stored = self.cache.stored()  # None, or bool per frame
+        self._transient = None
+        self._transient_lookahead = max(4, 2 * self.prefetch)  # batches whose unstored frames are decoded ahead
+        if not self.cache.complete or self.cache.limited:
             from fastload.fill import CacheFiller, default_decode_workers
 
+            slots = reserve = 0
+            if self.cache.limited:
+                deltas = {tuple(self.delta_np[k].tolist()) for k in self.cam_keys if k in self.delta_np}
+                per_batch = self.batch_size * (1 + sum(len(d) for d in deltas))  # bound of _needed_frames(rows)
+                reserve = 2 * per_batch  # the batch being assembled (and one re-assembled on the training thread)
+                slots = reserve + self._transient_lookahead * per_batch
             self._filler = CacheFiller(self.cache, _lr.dataset_source(dataset), self._ep_from_np, self._ep_to_np,
-                                       decode_workers or default_decode_workers(), background=background_fill)
+                                       decode_workers or default_decode_workers(), background=background_fill,
+                                       transient_slots=slots, transient_reserve=reserve)
+            self._transient = self._filler.transient
         self._copy_stream = torch.cuda.Stream(device=self.device) if self.is_cuda else None
         self._iterators: "weakref.WeakSet[_EpochIterator]" = weakref.WeakSet()
         _ACTIVE_LOADERS.add(self)
@@ -470,11 +491,13 @@ class FastLoader:
             logger.info(f"fastload: rank {self.rank} no VRAM left for frames; host tier only")
             return
         t0 = time.perf_counter()
-        # Whole episodes, in a seed-fixed random order, until the budget is used.
+        # Whole episodes, in a seed-fixed random order, until the budget is used (a size-limited cache: stored ones).
         order = np.random.default_rng(self.seed + 7919 * self.rank).permutation(self.local_episodes)
         ranges, frames = [], 0
         for ep in order:
             a, b = int(self._ep_from_np[ep]), int(self._ep_to_np[ep])
+            if self._stored is not None and (b <= a or not self._stored[a]):
+                continue
             if (frames + b - a) * fb > budget:
                 break
             ranges.append((a, b))
@@ -600,6 +623,26 @@ class FastLoader:
         cache is complete. Training does not need this: the filler completes the cache in the background."""
         return self._filler.finish(timeout) if self._filler is not None else True
 
+    def _transient_frames(self, rows: np.ndarray) -> np.ndarray:
+        """Frames of the samples ``rows`` that a size-limited cache does not store (sorted, unique)."""
+        f = self._needed_frames(rows)
+        return np.unique(f[~self._stored[f]])
+
+    def _read(self, key: str, flat: np.ndarray, th: Any) -> np.ndarray:
+        """uint8 frames ``flat`` of camera ``key`` (a copy): from the cache, and those it does not store from the
+        scratch rows of ``th`` (a :class:`fastload.fill.TransientHandle`)."""
+        mm = self.cache.array(key)
+        if th is None:
+            return mm[flat]
+        st = self._stored[flat]
+        if st.all():
+            return mm[flat]
+        out = np.empty((len(flat), *self.cam_shape[key]), dtype=np.uint8)
+        if st.any():
+            out[st] = mm[flat[st]]
+        out[~st] = self._transient.read(key, th, flat[~st])
+        return out
+
     def _needed_frames(self, rows: np.ndarray) -> np.ndarray:
         """Absolute frame indices of every camera frame of the samples ``rows`` (observation history included)."""
         abs_idx = self._index_np[rows]
@@ -644,8 +687,24 @@ class FastLoader:
             return img[:, 0] if key in self.video_keys and img.shape[1] == 1 else img
         return img[:, 0]
 
-    def _prepare(self, rows: np.ndarray, batch_index: int = -1, ops: list | None = None) -> _Prepared:
-        """CPU work + host->GPU copies for one batch (runs in the background thread)."""
+    def _prepare(self, rows: np.ndarray, batch_index: int = -1, ops: list | None = None,
+                 transient: Any = None) -> _Prepared:
+        """CPU work + host->GPU copies for one batch (runs in the background thread). ``transient``: scratch rows
+        acquired ahead for the frames a size-limited cache does not store (acquired here otherwise)."""
+        th = transient
+        try:
+            if self._transient is not None:
+                if th is None:
+                    tf = self._transient_frames(rows)
+                    th = self._transient.acquire(tf) if len(tf) else None
+                if th is not None:
+                    self._transient.wait(th)
+            return self._prepare_frames(rows, batch_index, ops, th)
+        finally:
+            if th is not None:
+                self._transient.release(th)  # the frames were copied out of the scratch rows
+
+    def _prepare_frames(self, rows: np.ndarray, batch_index: int, ops: list | None, th: Any) -> _Prepared:
         if self._filling:  # wait until every frame this batch reads is decoded and stored
             self._filler.ensure(self._needed_frames(rows))
         tier = self._tier
@@ -686,7 +745,7 @@ class FastLoader:
                     # LeRobot's exact image path on the CPU: uint8 -> float32 / 255 -> decode hook -> squeeze ->
                     # transforms (here if the parameters are known, else in _finalize on the main thread).
                     c, h, w = self.cam_shape[key]
-                    raw = torch.from_numpy(np.ascontiguousarray(self.cache.array(key)[flat]))
+                    raw = torch.from_numpy(np.ascontiguousarray(self._read(key, flat, th)))
                     x = (raw.to(torch.float32) / 255).view(len(rows), t, c, h, w)
                     if key in self.hook_keys:
                         x = torch.stack([self._run_hook(key, x[i], int(rows[i]), entry["ts"][i]) for i in range(len(rows))])
@@ -701,7 +760,7 @@ class FastLoader:
                 if key in self.hook_keys and self.hook_device == "cpu":
                     # Exactly LeRobot's data path: uint8 -> float32 / 255 -> wrapper, per sample, on the CPU.
                     c, h, w = self.cam_shape[key]
-                    raw = torch.from_numpy(np.ascontiguousarray(self.cache.array(key)[flat]))
+                    raw = torch.from_numpy(np.ascontiguousarray(self._read(key, flat, th)))
                     x = (raw.to(torch.float32) / 255).view(len(rows), t, c, h, w)
                     y = torch.stack([self._run_hook(key, x[i], int(rows[i]), entry["ts"][i]) for i in range(len(rows))])
                     entry["post"] = to_dev(y, pin=True)
@@ -711,7 +770,7 @@ class FastLoader:
                 host_pos = np.nonzero(slot < 0)[0]
                 gpu_pos = np.nonzero(slot >= 0)[0]
                 if len(host_pos):
-                    data = self.cache.array(key)[flat[host_pos]]  # memmap gather -> [h, C, H, W]
+                    data = self._read(key, flat[host_pos], th)  # memmap gather -> [h, C, H, W]
                     entry["host_pos"] = to_dev(host_pos)
                     entry["host_data"] = to_dev(data, pin=True)
                 if len(gpu_pos):
@@ -877,7 +936,12 @@ class _EpochIterator:
         # the filler's processes) and a few more prepared batches absorb decoding jitter.
         self._fill = loader._filler if loader._filling else None
         self._requested = 0
-        self._queue: queue.Queue = queue.Queue(maxsize=loader.prefetch if self._fill is None
+        # Size-limited cache: scratch rows for the frames it does not store, acquired (and decoding queued) a few
+        # batches ahead; batch index -> TransientHandle until the batch is prepared.
+        self._transient = loader._transient
+        self._t_requested = 0
+        self._handles: dict[int, Any] = {}
+        self._queue: queue.Queue = queue.Queue(maxsize=loader.prefetch if self._fill is None and self._transient is None
                                                else max(loader.prefetch, 4))
         self._stop = threading.Event()
         self._pending: list[tuple[int, np.ndarray]] = []
@@ -902,12 +966,30 @@ class _EpochIterator:
                     while self._requested < ahead:
                         self._fill.request(self.loader._needed_frames(self.batches[self._requested]))
                         self._requested += 1
+                if self._transient is not None:
+                    self._t_requested = max(self._t_requested, i)
+                    ahead = min(len(self.batches), i + self.loader._transient_lookahead)
+                    while self._t_requested < ahead:
+                        tf = self.loader._transient_frames(self.batches[self._t_requested])
+                        if len(tf):
+                            h = self._transient.acquire(tf, block=False)
+                            if h is None:
+                                break  # scratch rows busy: ask again after this batch
+                            self._handles[self._t_requested] = h
+                        self._t_requested += 1
                 pre = self._pre_ops[i] if self._pre_ops is not None else None
-                if self._stop.is_set() or not self._put(self.loader._prepare(rows, i, pre)):
+                if self._stop.is_set():
+                    return
+                prep = self.loader._prepare(rows, i, pre, self._handles.pop(i, None))
+                if not self._put(prep):
                     return
             self._put(StopIteration)
         except BaseException as e:  # surface errors in the training thread
             self._put(e)
+        finally:
+            for h in list(self._handles.values()):
+                self._transient.release(h)
+            self._handles.clear()
 
     def close(self) -> None:
         """Stop the prefetch thread (idempotent)."""

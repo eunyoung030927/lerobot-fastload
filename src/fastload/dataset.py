@@ -15,7 +15,7 @@ check_lerobot_version()
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 
 from fastload import _lr  # noqa: E402
-from fastload.cache import DEFAULT_MIN_FREE_DISK_GB, FrameCache  # noqa: E402
+from fastload.cache import DEFAULT_MAX_CACHE_GB, DEFAULT_MIN_FREE_DISK_GB, FrameCache  # noqa: E402
 from fastload.decode_hook import active_hook, apply_hook  # noqa: E402
 
 
@@ -33,13 +33,16 @@ class CachedLeRobotDataset(LeRobotDataset):
     @classmethod
     def from_dataset(cls, dataset: LeRobotDataset, cache_dir: str | Path, cache_mode: str = "prebuilt",
                      min_free_disk_gb: float | None = DEFAULT_MIN_FREE_DISK_GB,
-                     build_workers: int | None = None) -> "CachedLeRobotDataset":
+                     build_workers: int | None = None,
+                     max_cache_gb: float | None = DEFAULT_MAX_CACHE_GB) -> "CachedLeRobotDataset":
         """Convert an existing LeRobotDataset in place (keeps all of its configuration).
 
         ``cache_mode``: ``"prebuilt"`` (the cache must be complete), ``"build_first"`` (build a missing / incomplete
         cache now, with ``build_workers`` decoder processes) or ``"during_training"`` (allocate it now; a
         :class:`fastload.FastLoader` fills it while it serves batches; frames not filled yet are decoded by LeRobot
         when the dataset is indexed directly). See :func:`fastload.fill.ensure_cache` for several processes per node.
+        ``max_cache_gb``: size limit of a cache created here; frames a size-limited cache does not store are decoded
+        by LeRobot when the dataset is indexed (by FastLoader's decoder processes in a FastLoader).
         """
         if isinstance(dataset, cls):
             return dataset
@@ -49,7 +52,7 @@ class CachedLeRobotDataset(LeRobotDataset):
             from fastload.fill import ensure_cache
 
             ensure_cache(cache_mode, cache_dir, lambda: _lr.dataset_source(dataset), min_free_disk_gb,
-                         num_workers=build_workers)
+                         num_workers=build_workers, max_cache_gb=max_cache_gb)
         cache = FrameCache(cache_dir, allow_incomplete=cache_mode == "during_training", repo_id=dataset.repo_id,
                            root=dataset.root)
         cache.check_compatible(dataset, keys=list(dataset.meta.video_keys))
@@ -81,9 +84,10 @@ class CachedLeRobotDataset(LeRobotDataset):
                 item[key] = None  # type: ignore[assignment]  # keeps LeRobot's key order
                 continue
             rel = _nearest(ep_ts, np.asarray(query_ts, dtype=np.float64), self.tolerance_s, key, ep_idx)
-            filled = cache.filled()  # None once the cache is complete
-            if filled is not None and not bool(np.all(filled[start + rel])):
-                # cache_mode="during_training" and these frames are not stored yet: LeRobot's own decoding
+            avail = cache.available()  # None when every frame is in the cache
+            if avail is not None and not bool(np.all(avail[start + rel])):
+                # frames not in the cache (a size-limited cache does not store them, or cache_mode="during_training"
+                # has not filled them yet): LeRobot's own decoding
                 fallback[key] = query_ts
                 item[key] = None  # type: ignore[assignment]  # keeps LeRobot's key order
                 continue
