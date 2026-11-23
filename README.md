@@ -91,6 +91,9 @@ python -m fastload.build_cache --repo_id <repo_id> --root <dataset dir> \
 
 * Size = frames × cameras × C×H×W bytes (e.g. 42k frames × 2 × 480×640×3 ≈ 77 GB; 934k frames of
   256×256 with 2–3 cameras ≈ 466 GB). Put it on local NVMe, not a network mount.
+* Size limit: `--max_cache_gb` (default 300). A larger dataset stores whole episodes, spread over the dataset, up to
+  that size, and training decodes the frames of the other episodes as it goes ([Cache size limit](#cache-size-limit));
+  `-1` = no limit.
 * Resumable: rerun the same command after an interruption. `--verify N` re-checks N random frames
   against LeRobot bit-exactly (default 32).
 * Disk check: before writing, `free disk - bytes still to write` must stay at least `--min_free_disk_gb`
@@ -120,6 +123,8 @@ accelerate launch --num_processes 8 -m fastload.train \
 | `--fastload.decode_workers` | see text | decoder processes for `build_first` (default half the CPU cores) / `during_training` (default half the CPU cores divided by the training processes of the node) |
 | `--fastload.background_fill` | true | `during_training`: while decoders are idle, also decode frames no batch asked for yet, so the cache completes |
 | `--fastload.min_free_disk_gb` | 20 | `build_first` / `during_training`: free disk that must remain after the cache is written (safety margin, not a size limit; -1 = off) |
+| `--fastload.max_cache_gb` | 300 | `build_first` / `during_training`: largest cache they create; a bigger dataset stores whole episodes up to this size and the other frames are decoded during training ([Cache size limit](#cache-size-limit); -1 = no limit) |
+| `--fastload.delete_cache` | true | delete the cache when training ends normally, if a training run created it (`build_first` / `during_training`); a `build_cache` cache is never deleted ([Deleting the cache](#deleting-the-cache-after-training)) |
 | `--fastload.order` | `lerobot` | `lerobot` = LeRobot's batches, order and data RNG (keep `--num_workers` as in your LeRobot runs); `shard` = each rank owns whole episodes (largest VRAM hit rate on many GPUs, different order) |
 | `--fastload.loader` | `fast` | `fast` = FastLoader; `dataloader` = LeRobot's DataLoader reading the cache (no VRAM tier) |
 | `--fastload.placement` | `auto` | `auto` grows a VRAM tier after warm-up; `gpu` puts the whole shard in VRAM at start; `host` never uses VRAM |
@@ -189,6 +194,40 @@ counts what is not on disk yet). Otherwise the run stops, before creating any ca
 free space and the options: put the cache on another disk (`--fastload.cache_dir`), cache fewer cameras
 (`build_cache --keys`, then `--fastload.loader=dataloader` decodes the others), or train with plain `lerobot-train`.
 It is a safety margin kept free for checkpoints, logs and the system, not a limit on the cache size.
+
+## Cache size limit
+
+`--fastload.max_cache_gb` / `build_cache --max_cache_gb` (default 300 GB; `-1` = no limit) caps the frames a cache
+holds. If the dataset's frames take more, the cache stores whole episodes, spread evenly over the dataset (not just
+the first ones), up to that size, and records them in `stored.npy`. The frames of the other episodes are decoded
+while training runs:
+
+* FastLoader: by its decoder processes (`--fastload.decode_workers`), a few batches ahead, into a small scratch area
+  `<cache_dir>/.transient/<host>-<pid>/` (a few GB at most, rows reused as batches are assembled, removed at the end),
+  then gathered with the cached frames. With `during_training` the same processes also fill the stored episodes.
+* `--fastload.loader=dataloader` (LeRobot's DataLoader over the cache): by LeRobot's own decoding in its workers.
+
+Batches, order and RNG states are LeRobot's either way (`tests/test_cache_modes.py`: `limited`, and identical ACT
+losses with half the frames cached). Speed lies between plain LeRobot and a full cache: each batch still waits for
+its uncached frames, so the gain grows with the cached share (decoding work per batch drops to the uncached share).
+The VRAM tier holds stored frames only.
+
+The limit is fixed when the cache is created; a resumed or reused cache keeps its episodes (a warning names the
+difference). The frame files have the full apparent size but are sparse: frames not stored take no disk space (`du`
+shows the real size; copy such a cache with `cp --sparse=always` or `rsync -S`). The disk check counts only the
+stored frames.
+
+## Deleting the cache after training
+
+A cache created by a training run (`build_first` / `during_training` on a missing cache; marked by a
+`CREATED_BY_TRAINING` file) is deleted when `fastload.train` ends normally (`--fastload.delete_cache`, default true).
+
+* Never deleted: a cache built with `python -m fastload.build_cache` (reused across runs), a cache any other training
+  process still uses (each process holds a lease file in `<cache_dir>/.users/`; the last one to finish deletes; leases
+  of dead processes on the same host are ignored), and a run that failed or was stopped (an OOM stop for
+  `fastload.supervise` included), so a resumed run reuses the cache.
+* `--fastload.delete_cache=false` keeps it, e.g. for several runs on the same data.
+* The log says `fastload: deleted the cache <dir> (... GB on disk)`.
 
 ## Custom training scripts
 

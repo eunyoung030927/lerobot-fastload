@@ -220,12 +220,15 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
                          device_type=accelerator.device.type)
     undo = None
     mode = getattr(args, "cache_mode", "prebuilt")
+    loader = getattr(args, "loader", "fast")
     if kind == "fast":
-        ds = CachedLeRobotDataset.from_dataset(ds, args.cache_dir, cache_mode=mode)
+        max_gb = getattr(args, "max_cache_gb", None)
+        ds = CachedLeRobotDataset.from_dataset(ds, args.cache_dir, cache_mode=mode,
+                                               max_cache_gb=-1 if max_gb is None else max_gb)
         fl = FastLoadConfig(cache_dir=args.cache_dir, order="lerobot", placement=args.placement,
                             decode_hook_device=args.hook_device, augment_device=args.augment_device,
                             cache_mode=mode, decode_workers=getattr(args, "decode_workers", None),
-                            background_fill=getattr(args, "background_fill", True))
+                            background_fill=getattr(args, "background_fill", True), loader=loader)
         undo, _ = install_hooks(fl)  # fastload.train's DataLoader dispatch: the DataLoader below is a FastLoader
     try:
         if sampler_kind == "episode_aware":  # lerobot_train 0.7: every map-style dataset
@@ -243,7 +246,7 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
         if undo is not None:
             undo()
     if kind == "fast":
-        assert type(dl).__name__ == "FastLoader", type(dl)
+        assert (type(dl).__name__ == "FastLoader") == (loader == "fast"), type(dl)
     dl = accelerator.prepare(dl)
 
     batches, states, epoch_s = [], [], []
@@ -269,7 +272,7 @@ def run(kind, args, accelerator, num_workers, sampler_kind, tf_cfg, persistent):
         states.append(_states())
         if max_batches is not None and len(batches) >= max_batches:
             break
-    if kind == "fast":
+    if kind == "fast" and loader == "fast":
         LAST_RUN.clear()
         LAST_RUN.update(epoch_s=epoch_s, complete_after_epochs=dl.cache_complete, fill_stats=dl.fill_stats)
         if getattr(args, "finish_cache", False):
@@ -357,7 +360,12 @@ def compare_caches(got_dir, ref_dir) -> list[str]:
     for f in ("format_version", "info_fingerprint", "total_frames", "total_episodes", "keys", "video_backend"):
         if gm.get(f) != rm.get(f):
             errors.append(f"meta {f}: {gm.get(f)!r} vs {rm.get(f)!r}")
+    for f in ("stored_frames", "stored_episodes"):
+        if gm.get(f) != rm.get(f):
+            errors.append(f"meta {f}: {gm.get(f)!r} vs {rm.get(f)!r}")
     files = [v["file"] for v in rm["keys"].values()] + [TIMESTAMPS_FILE, FILLED_FILE]
+    if (ref_dir / "stored.npy").exists() or (got_dir / "stored.npy").exists():
+        files.append("stored.npy")
     for name in files:
         a, b = np.load(got_dir / name, mmap_mode="r"), np.load(ref_dir / name, mmap_mode="r")
         if a.dtype != b.dtype or a.shape != b.shape:
@@ -400,6 +408,11 @@ def main() -> int:
                         "cache identical to --cache_dir's (build_cache)")
     p.add_argument("--fill_dir", default=None, help="where the during_training caches go (default: a temp dir)")
     p.add_argument("--decode_workers", type=int, default=2)
+    p.add_argument("--cache_fraction", type=float, default=None,
+                   help="size-limited cache: max_cache_gb = this fraction of the full cache (prebuilt: built with "
+                        "build_cache --max_cache_gb into <cache_dir>_limited; during_training: the same limit)")
+    p.add_argument("--loader", choices=["fast", "dataloader"], default="fast",
+                   help="dataloader: LeRobot's DataLoader over CachedLeRobotDataset (--fastload.loader=dataloader)")
     args = p.parse_args()
     args.finish_cache = args.cache_mode == "during_training"
     args.max_frac = None
@@ -419,7 +432,7 @@ def main() -> int:
 
     tmp = None
     if args.repo_id is None:
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)  # Windows: files a process still maps
         args.root = str(Path(tmp.name) / "ds")
         args.repo_id = make_synthetic(Path(args.root), videos=args.video, language=args.language)
         args.cache_dir = str(Path(tmp.name) / "cache")
@@ -427,6 +440,25 @@ def main() -> int:
         # inherit (LeRobot's global decoder cache), which breaks LeRobot's own worker decoding.
         subprocess.check_call([sys.executable, "-m", "fastload.build_cache", "--repo_id", args.repo_id, "--root",
                                args.root, "--cache_dir", args.cache_dir, "--num_workers", "1", "--verify", "8"])
+    args.max_cache_gb = None
+    if args.cache_fraction is not None:
+        import json
+
+        meta = json.loads((Path(args.cache_dir) / "fastload_meta.json").read_text())
+        full = meta["total_frames"] * sum(int(np.prod(v["shape"])) for v in meta["keys"].values())
+        args.max_cache_gb = args.cache_fraction * full / 1e9
+        limited = args.cache_dir.rstrip("/\\") + "_limited"
+        if not (Path(limited) / "COMPLETE").exists():
+            subprocess.check_call([sys.executable, "-m", "fastload.build_cache", "--repo_id", args.repo_id, "--root",
+                                   args.root, "--cache_dir", limited, "--num_workers", "1", "--verify", "8",
+                                   "--max_cache_gb", repr(args.max_cache_gb),
+                                   *(["--video_backend", meta["video_backend"]] if meta.get("video_backend") else [])])
+        lm = json.loads((Path(limited) / "fastload_meta.json").read_text())
+        print(f"  size-limited cache: max_cache_gb={args.max_cache_gb:.3g} stores {lm.get('stored_frames')} of "
+              f"{lm['total_frames']} frames ({lm.get('stored_episodes')} episodes)", flush=True)
+        if lm.get("stored_frames", lm["total_frames"]) >= lm["total_frames"]:
+            raise SystemExit("--cache_fraction did not limit the cache")
+        args.cache_dir = limited  # prebuilt: the limited cache; during_training: the reference for compare_caches
     if args.decode_hook == "resize":
         # Spawned DataLoader workers (multiprocessing_context="spawn" since LeRobot 0.6) re-import this module, so
         # the wrapper is installed at import time, like a training script that installs it at module level.
@@ -461,6 +493,12 @@ def main() -> int:
                   f"{st.get('wait_s', 0):.2f}s for frames")
             errors += compare_caches(args.cache_dir, built_cache)
             args.cache_dir = built_cache
+        if args.max_cache_gb is not None and args.loader == "fast":
+            st = LAST_RUN.get("fill_stats_final") or LAST_RUN.get("fill_stats") or {}
+            print(f"    {tag}frames the cache does not store: {st.get('transient_frames')} decoded in "
+                  f"{st.get('transient_tasks')} tasks, waited {st.get('transient_wait_s', 0):.2f}s")
+            if not st.get("transient_frames"):
+                errors.append("no frame outside the size-limited cache was decoded")
         print(f"  {tag}{name}: {'OK' if not errors else 'FAIL'} ({len(ref[0])} batches)", flush=True)
         for e in errors[:8]:
             print(f"    {e}")

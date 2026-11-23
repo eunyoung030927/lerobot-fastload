@@ -11,7 +11,10 @@ The cache (``--fastload.cache_mode``): ``prebuilt`` (default) needs a complete c
 the process group exist, so no collective can time out; only ``LOCAL_RANK`` 0 of each node builds, the other local
 ranks wait for it); ``during_training`` allocates it there and FastLoader fills it while the first epoch runs (see
 :mod:`fastload.fill`). The dataset to decode comes from the ``--dataset.*`` arguments (or the ``train_config.json`` of
-``--config_path`` when resuming).
+``--config_path`` when resuming). A cache created this way holds at most ``--fastload.max_cache_gb`` (default 300 GB)
+of frames, whole episodes spread over the dataset; the frames of the other episodes are decoded during training. It
+is deleted when training ends normally (``--fastload.delete_cache``, default true; a cache from ``build_cache`` is
+never deleted, nor one another training process still uses).
 
 This runs LeRobot's own ``lerobot.scripts.lerobot_train.train`` unchanged except for three hooks:
 
@@ -51,7 +54,16 @@ import numpy as np
 import torch
 
 from fastload import _lr
-from fastload.cache import CACHE_MODES, DEFAULT_MIN_FREE_DISK_GB, DiskSpaceError, cache_status, missing_cache_message
+from fastload.cache import (
+    CACHE_MODES,
+    DEFAULT_MAX_CACHE_GB,
+    DEFAULT_MIN_FREE_DISK_GB,
+    DiskSpaceError,
+    acquire_lease,
+    cache_status,
+    missing_cache_message,
+    release_lease,
+)
 from fastload.dataset import CachedLeRobotDataset
 from fastload.loader import ORDERS, PLACEMENTS, FastLoader, active_loaders
 
@@ -74,6 +86,12 @@ class FastLoadConfig:
     background_fill: bool = True
     # Refuse to write the cache unless this much disk stays free afterwards (GB; a safety margin, -1 = no check).
     min_free_disk_gb: float = DEFAULT_MIN_FREE_DISK_GB
+    # Largest cache build_first / during_training create (GB of frames): a bigger dataset stores whole episodes up to
+    # this size and the frames of the others are decoded during training (-1 = no limit).
+    max_cache_gb: float = DEFAULT_MAX_CACHE_GB
+    # Delete the cache when training ends normally, if a training run created it (build_first / during_training) and
+    # no other training process uses it. A cache from `python -m fastload.build_cache` is never deleted.
+    delete_cache: bool = True
     # "fast" = FastLoader (GPU tier + prefetch thread); "dataloader" = LeRobot's DataLoader over the cache.
     loader: str = "fast"
     # "lerobot" = same batches, order and data RNG draws as LeRobot's DataLoader (needs the same --num_workers);
@@ -293,7 +311,7 @@ def install_hooks(fl: FastLoadConfig):
         # eval dataset: LeRobot's decoding. build_first / during_training already prepared the cache in main().
         train_ds = CachedLeRobotDataset.from_dataset(train_ds, fl.cache_dir, cache_mode=fl.cache_mode,
                                                      min_free_disk_gb=fl.min_free_disk_gb,
-                                                     build_workers=fl.decode_workers)
+                                                     build_workers=fl.decode_workers, max_cache_gb=fl.max_cache_gb)
         logger.info(f"fastload: frames from cache {fl.cache_dir} (loader={fl.loader})")
         return train_ds, eval_ds
 
@@ -384,6 +402,14 @@ def install_hooks(fl: FastLoadConfig):
     return undo, state
 
 
+def _close_loaders() -> None:
+    for ld in active_loaders():
+        try:
+            ld.close()
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"fastload: closing a FastLoader failed: {e}")
+
+
 def prepare_cache(fl: FastLoadConfig, train_args: list[str]) -> None:
     """Before ``lerobot_train.train()``: check (prebuilt), build (build_first) or allocate (during_training) the cache.
 
@@ -407,7 +433,7 @@ def prepare_cache(fl: FastLoadConfig, train_args: list[str]) -> None:
                         datefmt="%Y-%m-%d %H:%M:%S", force=True)
     try:
         ensure_cache(fl.cache_mode, fl.cache_dir, lambda: _lr.dataset_source_from_cli(train_args),
-                     fl.min_free_disk_gb, num_workers=fl.decode_workers)
+                     fl.min_free_disk_gb, num_workers=fl.decode_workers, max_cache_gb=fl.max_cache_gb)
     except DiskSpaceError as e:
         raise SystemExit(str(e)) from None
 
@@ -425,6 +451,8 @@ def main(argv: list[str] | None = None) -> None:
     if remote is not None and remote():
         raise SystemExit("fastload: --job.target=<remote> is not supported; fastload.train runs locally")
     undo, state = install_hooks(fl)
+    lease = acquire_lease(fl.cache_dir)  # another run ending meanwhile does not delete the cache under this one
+    finished = False
     try:
         try:  # lerobot >= 0.4.4
             from lerobot.utils.import_utils import register_third_party_plugins
@@ -433,8 +461,11 @@ def main(argv: list[str] | None = None) -> None:
         except ImportError:
             pass
         lt.train()
+        finished = True
     finally:
         undo()
+        _close_loaders()  # decoder processes and scratch files go before the cache may be deleted
+        release_lease(fl.cache_dir, lease, delete=fl.delete_cache and finished)
     if fl.loader == "fast" and state["fast_loaders"] == 0:
         logger.warning("fastload: train() never built a DataLoader for the cached dataset; FastLoader was unused")
 
