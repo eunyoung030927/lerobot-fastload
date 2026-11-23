@@ -50,7 +50,7 @@ sys.path.insert(0, str(TESTS_DIR))
 sys.path.insert(0, str(REPO / "src"))
 
 ALL_TESTS = ("during_training", "restart", "build_first", "min_free_disk", "prebuilt_missing", "multiprocess",
-             "losses", "timing")
+             "limited", "delete_cache", "losses", "timing")
 HUGE_GB = "1e9"
 
 
@@ -197,7 +197,7 @@ def test_build_first(data: Data, work: Path) -> list[str]:
     ref_backend = json.loads((data.cache / "fastload_meta.json").read_text()).get("video_backend")
     p = _run([sys.executable, "-m", "fastload.train", *_act_args(data, out, 6),
               *([f"--dataset.video_backend={ref_backend}"] if ref_backend else []),
-              f"--fastload.cache_dir={cache}", "--fastload.cache_mode=build_first"],
+              f"--fastload.cache_dir={cache}", "--fastload.cache_mode=build_first", "--fastload.delete_cache=false"],
              log=work / f"build_first_{data.variant}.log")
     text = p.stdout + p.stderr
     errors = []
@@ -327,6 +327,117 @@ def test_multiprocess(data: Data, work: Path) -> list[str]:
     return []
 
 
+def _full_gb(data: Data) -> float:
+    meta = json.loads((data.cache / "fastload_meta.json").read_text())
+    return meta["total_frames"] * sum(int(np.prod(v["shape"])) for v in meta["keys"].values()) / 1e9
+
+
+def test_limited(data: Data, work: Path) -> list[str]:
+    """Size-limited cache (half the frames): build_cache stores whole episodes only (the rest takes no disk on Linux),
+    and FastLoader (prebuilt / during_training) and LeRobot's DataLoader over the cache give LeRobot's batches."""
+    errors: list[str] = []
+    limited = Path(str(data.cache) + "_limited")
+    common = ["--repo_id", data.repo_id, "--root", data.root, "--cache_dir", data.cache, "--cache_fraction", "0.5",
+              "--samplers", "episode_aware", "--workers", "0,2", "--persistent", "on", "--transforms", "off,on",
+              "--augment_device", "cpu", "--atol", "0"]
+    runs = [("prebuilt, FastLoader", []), ("prebuilt, LeRobot DataLoader", ["--loader", "dataloader"]),
+            ("during_training, FastLoader", ["--cache_mode", "during_training", "--fill_dir", work / f"lim_fill_{data.variant}"])]
+    for name, extra in runs:
+        p = _run([sys.executable, TESTS_DIR / "test_lerobot_order.py", *common, *extra],
+                 log=work / f"limited_{data.variant}_{len(extra)}.log")
+        out = _noise_free(p.stdout)
+        print(f"    [{name}]")
+        print("\n".join("      " + line for line in out.splitlines() if line.strip()))
+        if p.returncode != 0 or not out.rstrip().endswith("PASS"):
+            errors.append(f"{name}: exit {p.returncode}: {_noise_free(p.stderr)[-2000:]}")
+    if not (limited / "fastload_meta.json").exists():
+        return errors + [f"no size-limited cache at {limited}"]
+    meta = json.loads((limited / "fastload_meta.json").read_text())
+    stored = np.load(limited / "stored.npy")
+    n, kept = meta["total_frames"], int(stored.sum())
+    fb = sum(int(np.prod(v["shape"])) for v in meta["keys"].values())
+    print(f"    limited cache: {kept} of {n} frames stored ({meta.get('stored_episodes')} of {meta['total_episodes']} "
+          f"episodes), {kept * fb} of max {meta['max_cache_gb'] * 1e9:.0f} bytes")
+    if not 0 < kept < n or kept * fb > meta["max_cache_gb"] * 1e9:
+        errors.append(f"stored {kept} of {n} frames ({kept * fb} bytes) for max_cache_gb={meta['max_cache_gb']}")
+    filled = np.load(limited / "filled.npy")
+    if not np.array_equal(filled > 0, stored > 0):
+        errors.append("filled frames != stored frames")
+    if hasattr(os, "statvfs"):  # sparse files: frames not stored take no disk space
+        from fastload.cache import allocated_bytes
+
+        on_disk = sum(allocated_bytes(limited / v["file"]) for v in meta["keys"].values())
+        print(f"    frame files on disk: {on_disk} bytes (stored frames {kept * fb}, full {n * fb})")
+        if on_disk > kept * fb + 64 * 4096 * len(meta["keys"]):
+            errors.append(f"frame files take {on_disk} bytes on disk, stored frames only {kept * fb}")
+    return errors
+
+
+def test_delete_cache(data: Data, work: Path) -> list[str]:
+    """A cache a training run created is deleted when training ends normally; not with delete_cache=false, not a
+    build_cache cache, not while another process holds a lease, not after a failed run."""
+    from fastload.cache import USERS_DIR, cache_status
+
+    errors: list[str] = []
+
+    def train(cache: Path, tag: str, *extra: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        cmd = [sys.executable, "-m", "fastload.train", *_act_args(data, work / f"out_del_{tag}_{data.variant}", 3),
+               f"--fastload.cache_dir={cache}", *extra]
+        if env:
+            old = {k: os.environ.get(k) for k in env}
+            os.environ.update(env)
+        try:
+            return _run(cmd, log=work / f"delete_{tag}_{data.variant}.log")
+        finally:
+            if env:
+                for k, v in old.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+    # 1. build_first (default delete_cache=true): gone after training
+    c1 = work / f"del_bf_{data.variant}"
+    p = train(c1, "bf", "--fastload.cache_mode=build_first")
+    ok = p.returncode == 0 and not c1.exists() and "deleted the cache" in p.stdout + p.stderr
+    print(f"    build_first: exit {p.returncode}, cache exists after: {c1.exists()}")
+    if not ok:
+        errors.append(f"build_first: exit {p.returncode}, cache still exists: {c1.exists()}: "
+                      f"{_noise_free(p.stderr)[-1500:]}")
+    # 2. during_training with delete_cache=false: kept
+    c2 = work / f"del_keep_{data.variant}"
+    p = train(c2, "keep", "--fastload.cache_mode=during_training", "--fastload.delete_cache=false")
+    print(f"    during_training delete_cache=false: exit {p.returncode}, kept: {c2.exists()}")
+    if p.returncode != 0 or cache_status(c2) == "missing":
+        errors.append(f"delete_cache=false: exit {p.returncode}, cache status {cache_status(c2)}")
+    # 3. the build_cache cache (prebuilt): never deleted
+    p = train(data.cache, "prebuilt")
+    print(f"    prebuilt (build_cache): exit {p.returncode}, kept: {data.cache.exists()}")
+    if p.returncode != 0 or cache_status(data.cache) != "complete":
+        errors.append(f"prebuilt: exit {p.returncode}, cache status {cache_status(data.cache)}")
+    # 4. c2 was created by training: a live lease of another process keeps it, then it is deleted
+    lease = c2 / USERS_DIR / f"{__import__('socket').gethostname()}-{os.getpid()}"
+    lease.parent.mkdir(exist_ok=True)
+    lease.write_text("test")
+    p = train(c2, "leased", "--fastload.cache_mode=during_training")
+    print(f"    another process holds a lease: exit {p.returncode}, kept: {c2.exists()}")
+    if p.returncode != 0 or not c2.exists() or "still used by" not in p.stdout + p.stderr:
+        errors.append(f"leased: exit {p.returncode}, kept {c2.exists()}")
+    # 5. a failed run (simulated OOM, no retry) keeps it for resuming
+    lease.unlink()
+    p = train(c2, "failed", "--fastload.cache_mode=during_training", "--fastload.oom_retry=false",
+              env={"FASTLOAD_DEBUG_OOM": "0:2"})
+    print(f"    failed run: exit {p.returncode}, kept: {c2.exists()}")
+    if p.returncode == 0 or not c2.exists():
+        errors.append(f"failed run: exit {p.returncode}, kept {c2.exists()}")
+    # 6. finally a normal run deletes it (the failed run's lease is stale)
+    p = train(c2, "last", "--fastload.cache_mode=during_training")
+    print(f"    normal run after that: exit {p.returncode}, deleted: {not c2.exists()}")
+    if p.returncode != 0 or c2.exists():
+        errors.append(f"last run: exit {p.returncode}, cache still exists: {c2.exists()}")
+    return errors
+
+
 def _losses(text: str) -> list[tuple[int, str]]:
     return [(int(m.group(1)), m.group(2)) for m in re.finditer(r"step:(\S+?) .*?loss:(\S+)", text)
             if m.group(1).isdigit()]
@@ -337,21 +448,30 @@ def test_losses(data: Data, work: Path) -> list[str]:
     a = _run([sys.executable, "-m", "lerobot.scripts.lerobot_train",
               *_act_args(data, work / "out_loss_lerobot", steps, num_workers=2, transforms=True)],
              log=work / "losses_lerobot.log")
-    b = _run([sys.executable, "-m", "fastload.train",
-              *_act_args(data, work / "out_loss_fastload", steps, num_workers=2, transforms=True),
-              f"--fastload.cache_dir={work / 'loss_cache'}", "--fastload.cache_mode=during_training"],
-             log=work / "losses_fastload.log")
-    if a.returncode or b.returncode:
-        return [f"training failed: lerobot exit {a.returncode}, fastload exit {b.returncode}: "
-                f"{_noise_free(a.stderr if a.returncode else b.stderr)[-3000:]}"]
-    la, lb = _losses(a.stdout + a.stderr), _losses(b.stdout + b.stderr)
+    if a.returncode:
+        return [f"lerobot_train failed (exit {a.returncode}): {_noise_free(a.stderr)[-3000:]}"]
+    la = _losses(a.stdout + a.stderr)
     print(f"    lerobot_train losses ({len(la)}): {' '.join(v for _, v in la)}")
-    print(f"    fastload.train losses ({len(lb)}): {' '.join(v for _, v in lb)}")
     if len(la) != steps:
         return [f"expected {steps} logged losses, got {len(la)}"]
-    if la != lb:
-        return [f"logged losses differ: {[(x, y) for x, y in zip(la, lb) if x != y][:5]}"]
-    return []
+    errors = []
+    # the whole cache, and a cache limited to half the frames (the others decoded by FastLoader's decoder processes)
+    for tag, limit in (("full", []), ("half", [f"--fastload.max_cache_gb={_full_gb(data) / 2!r}"])):
+        b = _run([sys.executable, "-m", "fastload.train",
+                  *_act_args(data, work / f"out_loss_fastload_{tag}", steps, num_workers=2, transforms=True),
+                  f"--fastload.cache_dir={work / f'loss_cache_{tag}'}", "--fastload.cache_mode=during_training", *limit],
+                 log=work / f"losses_fastload_{tag}.log")
+        if b.returncode:
+            errors.append(f"fastload.train ({tag} cache) failed (exit {b.returncode}): {_noise_free(b.stderr)[-3000:]}")
+            continue
+        text = b.stdout + b.stderr
+        lb = _losses(text)
+        print(f"    fastload.train losses, {tag} cache ({len(lb)}): {' '.join(v for _, v in lb)}")
+        if la != lb:
+            errors.append(f"{tag} cache: logged losses differ: {[(x, y) for x, y in zip(la, lb) if x != y][:5]}")
+        if limit and "the cache stores" not in text:
+            errors.append("half cache: no size-limit log line")
+    return errors
 
 
 def test_timing(work: Path, episodes: int = 30) -> list[str]:
@@ -397,7 +517,7 @@ def main() -> int:
             shutil.rmtree(work)
         work.mkdir(parents=True)
     else:
-        tmp = tempfile.TemporaryDirectory()
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)  # Windows: files a process still maps
         work = Path(tmp.name)
     results: list[tuple[str, list[str], float]] = []
     per_variant = [t for t in tests if t not in ("losses", "timing")]
