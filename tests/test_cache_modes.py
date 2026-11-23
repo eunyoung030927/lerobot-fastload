@@ -350,6 +350,8 @@ def test_limited(data: Data, work: Path) -> list[str]:
         print("\n".join("      " + line for line in out.splitlines() if line.strip()))
         if p.returncode != 0 or not out.rstrip().endswith("PASS"):
             errors.append(f"{name}: exit {p.returncode}: {_noise_free(p.stderr)[-2000:]}")
+    if not (limited / "fastload_meta.json").exists():
+        return errors + [f"no size-limited cache at {limited}"]
     meta = json.loads((limited / "fastload_meta.json").read_text())
     stored = np.load(limited / "stored.npy")
     n, kept = meta["total_frames"], int(stored.sum())
